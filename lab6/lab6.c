@@ -12,7 +12,7 @@ typedef struct
 {
     pthread_t tid;
     float time_to_live;
-    bool stopped;
+    bool sigusr1_sent;
 } ThreadInfo;
 
 pthread_key_t clock_running_key;
@@ -26,8 +26,32 @@ static void free_memory(void *buffer)
 
 void create_keys()
 {
-    pthread_key_create(&clock_running_key, free_memory);
-    pthread_key_create(&start_time_key, free_memory);
+    if (pthread_key_create(&clock_running_key, free_memory) != 0)
+    {
+        fprintf(stderr, "pthread_create error\n");
+        exit(EXIT_FAILURE);
+    }
+    if (pthread_key_create(&start_time_key, free_memory) != 0)
+    {
+        fprintf(stderr, "pthread_create error\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void delete_keys()
+{
+    if (pthread_key_delete(clock_running_key) != 0)
+    {
+        fprintf(stderr, "pthread_create error\n");
+        exit(EXIT_FAILURE);
+    }
+    if (pthread_key_delete(start_time_key) != 0)
+    {
+        fprintf(stderr, "pthread_create error\n");
+        exit(EXIT_FAILURE);
+    }
+    //     pthread_key_delete(clock_running_key);
+    //     pthread_key_delete(start_time_key);
 }
 
 void start()
@@ -70,11 +94,10 @@ size_t stop()
         return -1;
     }
     *clock_running = false;
-    struct timespec *start_time = pthread_getspecific(start_time_key);
+    const struct timespec *start_time = pthread_getspecific(start_time_key);
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
-    //todo: count ms
     const float elapsed_seconds = (float) (now.tv_sec - start_time->tv_sec) +
                                   (float) (now.tv_nsec - start_time->tv_nsec) / BILLION;
     return elapsed_seconds * 1000;
@@ -82,11 +105,8 @@ size_t stop()
 
 void sigusr1_handler(int sig_num)
 {
-    //todo: delete keys
     size_t millis = stop();
-    printf("Stopping, tid: %ld, execution time: %ld ms\n", pthread_self(), millis);
-    pthread_key_delete(clock_running_key);
-    pthread_key_delete(start_time_key);
+    printf("Thread stopped, tid: %ld, execution time: %ld ms\n", pthread_self(), millis);
     pthread_exit(&millis);
 }
 
@@ -133,21 +153,18 @@ int main(const int argc, char *argv[])
         fprintf(stderr, "malloc error\n");
         exit(EXIT_FAILURE);
     }
-
     struct sigaction sa;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sa.sa_handler = sigusr1_handler;
     sigaction(SIGUSR1, &sa, NULL);
 
+    pthread_once(&keys_once, create_keys);
     srand((unsigned int) time(NULL));
     for (long i = 0; i < nr_threads; i++)
     {
-        threads[i].stopped = false;
+        threads[i].sigusr1_sent = false;
         const float time_to_live = ((float) rand() / (float) RAND_MAX) * max_time_to_live;
-        // const long seconds = time;
-        // const long nanoseconds = (time - (long) time) * BILLION;
-        // const struct timespec time_to_live = {seconds, nanoseconds};
         threads[i].time_to_live = time_to_live;
         if (pthread_create(&threads[i].tid, NULL, thread_func, NULL) != 0)
         {
@@ -171,9 +188,9 @@ int main(const int argc, char *argv[])
                               (float) (now.tv_nsec - start.tv_nsec) / BILLION;
         for (long i = 0; i < nr_threads; i++)
         {
-            if (!threads[i].stopped && elapsed >= threads[i].time_to_live)
+            if (!threads[i].sigusr1_sent && elapsed >= threads[i].time_to_live)
             {
-                threads[i].stopped = true;
+                threads[i].sigusr1_sent = true;
                 stopped_threads++;
                 if (pthread_kill(threads[i].tid, SIGUSR1) != 0)
                 {
@@ -186,6 +203,12 @@ int main(const int argc, char *argv[])
     }
 
     for (long i = 0; i < nr_threads; i++)
+    {
         pthread_join(threads[i].tid, NULL);
+        // void* millis;
+        // pthread_join(threads[i].tid, &millis);
+        // printf("Thread stopped, tid: %ld, execution time: %ld ms\n", threads[i].tid, *(size_t*)millis);
+    }
+    delete_keys();
     free(threads);
 }
