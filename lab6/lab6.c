@@ -50,8 +50,6 @@ void delete_keys()
         fprintf(stderr, "pthread_create error\n");
         exit(EXIT_FAILURE);
     }
-    //     pthread_key_delete(clock_running_key);
-    //     pthread_key_delete(start_time_key);
 }
 
 void start()
@@ -85,7 +83,7 @@ void* thread_func(void *unused)
     }
 }
 
-size_t stop()
+long long stop()
 {
     pthread_once(&keys_once, create_keys);
     bool *clock_running = pthread_getspecific(clock_running_key);
@@ -105,8 +103,8 @@ size_t stop()
 
 void sigusr1_handler(int sig_num)
 {
-    size_t millis = stop();
-    printf("Thread stopped, tid: %ld, execution time: %ld ms\n", pthread_self(), millis);
+    long long millis = stop();
+    printf("Thread stopped, tid: %ld, execution time: %lld ms\n", pthread_self(), millis);
     pthread_exit(&millis);
 }
 
@@ -205,9 +203,6 @@ int main(const int argc, char *argv[])
     for (long i = 0; i < nr_threads; i++)
     {
         pthread_join(threads[i].tid, NULL);
-        // void* millis;
-        // pthread_join(threads[i].tid, &millis);
-        // printf("Thread stopped, tid: %ld, execution time: %ld ms\n", threads[i].tid, *(size_t*)millis);
     }
     delete_keys();
     free(threads);
