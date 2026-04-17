@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
-#include <signal.h>
 #include <stdbool.h>
 #include "thread_time.h"
 
@@ -66,7 +65,7 @@ int main(const int argc, char *argv[])
                 break;
             case 't':
                 val = strtol(optarg, &endptr, 0);
-                if (endptr == optarg || val < 1)
+                if (endptr == optarg || val < 0)
                 {
                     fprintf(stderr, "%s: option '%c' requires number >= 1 as a parameter\n", argv[0], ret);
                     exit(EXIT_FAILURE);
