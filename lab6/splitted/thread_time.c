@@ -8,7 +8,7 @@ static pthread_key_t clock_running_key;
 static pthread_key_t start_time_key;
 pthread_once_t keys_once = PTHREAD_ONCE_INIT;
 
-void free_memory(void *buffer)
+static void free_memory(void *buffer)
 {
     free(buffer);
 }

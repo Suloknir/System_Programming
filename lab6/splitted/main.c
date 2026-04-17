@@ -27,11 +27,11 @@ void thread_cancel_handler(void *unused)
 
 void* thread_func(void *unused)
 {
+    pthread_cleanup_push(thread_cancel_handler, NULL);
+    start();
     #if EASY_ON_CPU == false
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
     #endif
-    pthread_cleanup_push(thread_cancel_handler, NULL);
-    start();
     // pretend that following loop calculates factorial
     for (;;)
     {
@@ -125,7 +125,7 @@ int main(const int argc, char *argv[])
                 stopped_threads++;
                 if (pthread_cancel(threads[i].tid) != 0)
                 {
-                    fprintf(stderr, "pthread_kill error\n");
+                    fprintf(stderr, "pthread_cancel error\n");
                     free(threads);
                     exit(EXIT_FAILURE);
                 }
