@@ -6,8 +6,6 @@
 #include <signal.h>
 #include <stdbool.h>
 
-#define BILLION 1000000000
-
 typedef struct
 {
     pthread_t tid;
@@ -42,12 +40,12 @@ void delete_keys()
 {
     if (pthread_key_delete(clock_running_key) != 0)
     {
-        fprintf(stderr, "pthread_create error\n");
+        fprintf(stderr, "pthread_key_delete error\n");
         exit(EXIT_FAILURE);
     }
     if (pthread_key_delete(start_time_key) != 0)
     {
-        fprintf(stderr, "pthread_create error\n");
+        fprintf(stderr, "pthread_key_delete error\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -97,7 +95,7 @@ long long stop()
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     const float elapsed_seconds = (float) (now.tv_sec - start_time->tv_sec) +
-                                  (float) (now.tv_nsec - start_time->tv_nsec) / BILLION;
+                                  (float) (now.tv_nsec - start_time->tv_nsec) / 1e9;
     return elapsed_seconds * 1000;
 }
 
@@ -105,7 +103,7 @@ void sigusr1_handler(int sig_num)
 {
     long long millis = stop();
     printf("Thread stopped, tid: %ld, execution time: %lld ms\n", pthread_self(), millis);
-    pthread_exit(&millis);
+    pthread_exit(NULL);
 }
 
 int main(const int argc, char *argv[])
@@ -183,7 +181,7 @@ int main(const int argc, char *argv[])
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         const float elapsed = (float) (now.tv_sec - start.tv_sec) +
-                              (float) (now.tv_nsec - start.tv_nsec) / BILLION;
+                              (float) (now.tv_nsec - start.tv_nsec) / 1e9;
         for (long i = 0; i < nr_threads; i++)
         {
             if (!threads[i].sigusr1_sent && elapsed >= threads[i].time_to_live)
