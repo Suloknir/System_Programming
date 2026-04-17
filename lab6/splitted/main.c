@@ -1,5 +1,8 @@
 // Compilation:
 // gcc main.c thread_time.c -o main -pthread
+
+#define EASY_ON_CPU true
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -16,7 +19,7 @@ typedef struct
     bool cancel_sent;
 } ThreadInfo;
 
-void thread_cancel_handler(void* unused)
+void thread_cancel_handler(void *unused)
 {
     const long long millis = stop();
     printf("Thread stopped, tid: %ld, execution time: %lld ms\n", pthread_self(), millis);
@@ -24,10 +27,19 @@ void thread_cancel_handler(void* unused)
 
 void* thread_func(void *unused)
 {
+    #if EASY_ON_CPU == false
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    #endif
     pthread_cleanup_push(thread_cancel_handler, NULL);
     start();
-    for (;;){} // pretend that this loop calculates factorial
+    // pretend that following loop calculates factorial
+    for (;;)
+    {
+        #if EASY_ON_CPU == true
+        const struct timespec loop_sleep = {0, 1000000}; //1 ms sleep to not drain CPU
+        nanosleep(&loop_sleep, NULL);
+        #endif
+    }
     pthread_cleanup_pop(0);
     return NULL;
 }
@@ -95,10 +107,12 @@ int main(const int argc, char *argv[])
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
     int stopped_threads = 0;
-    const struct timespec loop_sleep = {0, 10000000}; //10ms sleep to not drain cpu
     while (stopped_threads < nr_threads)
     {
+        #if EASY_ON_CPU == true
+        const struct timespec loop_sleep = {0, 10000000}; //10 ms sleep to not drain CPU
         nanosleep(&loop_sleep, NULL);
+        #endif
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         const float elapsed = (float) (now.tv_sec - start.tv_sec) +
