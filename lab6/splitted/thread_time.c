@@ -8,7 +8,7 @@ static pthread_key_t clock_running_key;
 static pthread_key_t start_time_key;
 pthread_once_t keys_once = PTHREAD_ONCE_INIT;
 
-static void free_memory(void *buffer)
+void free_memory(void *buffer)
 {
     free(buffer);
 }
@@ -36,6 +36,11 @@ void start()
     {
         clock_running = malloc(sizeof(bool));
         start_time = malloc(sizeof(struct timespec));
+        if (clock_running == NULL || start_time == NULL)
+        {
+            fprintf(stderr, "malloc error\n");
+            exit(EXIT_FAILURE);
+        }
         *clock_running = false;
         pthread_setspecific(clock_running_key, clock_running);
         pthread_setspecific(start_time_key, start_time);

@@ -13,24 +13,23 @@ typedef struct
 {
     pthread_t tid;
     float time_to_live;
-    bool sigusr1_sent;
+    bool cancel_sent;
 } ThreadInfo;
+
+void thread_cancel_handler(void* unused)
+{
+    const long long millis = stop();
+    printf("Thread stopped, tid: %ld, execution time: %lld ms\n", pthread_self(), millis);
+}
 
 void* thread_func(void *unused)
 {
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    pthread_cleanup_push(thread_cancel_handler, NULL);
     start();
-    for (;;)
-    {
-        constexpr struct timespec loop_sleep = {0, 1000000}; //1ms sleep to not drain cpu
-        nanosleep(&loop_sleep, NULL);
-    }
-}
-
-void sigusr1_handler(int sig_num)
-{
-    long long millis = stop();
-    printf("Thread stopped, tid: %ld, execution time: %lld ms\n", pthread_self(), millis);
-    pthread_exit(NULL);
+    for (;;){} // pretend that this loop calculates factorial
+    pthread_cleanup_pop(0);
+    return NULL;
 }
 
 int main(const int argc, char *argv[])
@@ -76,17 +75,12 @@ int main(const int argc, char *argv[])
         fprintf(stderr, "malloc error\n");
         exit(EXIT_FAILURE);
     }
-    struct sigaction sa;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sa.sa_handler = sigusr1_handler;
-    sigaction(SIGUSR1, &sa, NULL);
 
     pthread_once(&keys_once, create_keys);
     srand((unsigned int) time(NULL));
     for (long i = 0; i < nr_threads; i++)
     {
-        threads[i].sigusr1_sent = false;
+        threads[i].cancel_sent = false;
         const float time_to_live = ((float) rand() / (float) RAND_MAX) * max_time_to_live;
         threads[i].time_to_live = time_to_live;
         if (pthread_create(&threads[i].tid, NULL, thread_func, NULL) != 0)
@@ -101,9 +95,9 @@ int main(const int argc, char *argv[])
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
     int stopped_threads = 0;
+    const struct timespec loop_sleep = {0, 10000000}; //10ms sleep to not drain cpu
     while (stopped_threads < nr_threads)
     {
-        constexpr struct timespec loop_sleep = {0, 10000000}; //10ms sleep to not drain cpu
         nanosleep(&loop_sleep, NULL);
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -111,11 +105,11 @@ int main(const int argc, char *argv[])
                               (float) (now.tv_nsec - start.tv_nsec) / 1e9;
         for (long i = 0; i < nr_threads; i++)
         {
-            if (!threads[i].sigusr1_sent && elapsed >= threads[i].time_to_live)
+            if (!threads[i].cancel_sent && elapsed >= threads[i].time_to_live)
             {
-                threads[i].sigusr1_sent = true;
+                threads[i].cancel_sent = true;
                 stopped_threads++;
-                if (pthread_kill(threads[i].tid, SIGUSR1) != 0)
+                if (pthread_cancel(threads[i].tid) != 0)
                 {
                     fprintf(stderr, "pthread_kill error\n");
                     free(threads);

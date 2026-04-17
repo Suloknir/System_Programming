@@ -4,6 +4,8 @@
 #include <pthread.h>
 extern pthread_once_t keys_once;
 
+void free_memory(void *buffer);
+
 void start();
 
 long long stop();
