@@ -35,13 +35,13 @@ int main(const int argc, char *argv[])
     }
     struct crypt_data data;
     data.initialized = 0;
-    char *hash_fun_id = "$6$";
-    size_t buf_len = strlen(salt) + strlen(hash_fun_id) + 1;
-    char* buffer = malloc(buf_len * sizeof(char));
+    char *hash_func = "$6$";
+    size_t buf_len = strlen(salt) + strlen(hash_func) + 1;
+    char *buffer = malloc(buf_len * sizeof(char));
     if (buffer == NULL)
         perror("malloc error");
-    snprintf(buffer, buf_len, "%s%s", hash_fun_id, salt);
-    const char* hash = crypt_r(password, buffer, &data);
+    snprintf(buffer, buf_len, "%s%s", hash_func, salt);
+    const char *hash = crypt_r(password, buffer, &data);
     free(buffer);
     if (hash == NULL)
         perror("crypt_r error\n");
