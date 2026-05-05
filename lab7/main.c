@@ -6,6 +6,11 @@
 
 void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_filename, int *ret_n_threads)
 {
+    if (ret_hash == NULL || ret_filename == NULL || ret_n_threads == NULL)
+    {
+        fprintf(stderr, "parse_argv requires non-null arguments\n");
+        exit(EXIT_FAILURE);
+    }
     *ret_hash = NULL;
     *ret_filename = NULL;
     *ret_n_threads = -1;
