@@ -61,22 +61,63 @@ void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_fi
     }
 }
 
-bool crack(const char *salted_hash, const char* pswd_path, int n_threads)
+void thread_crack(int id, char *pswd, size_t length) {}
+
+bool crack(const char *salted_hash, const char *pswd_path, int n_threads) //todo: refactor that awfulness
 {
     int fd = open(pswd_path, O_RDONLY);
     if (fd == -1)
         err(EXIT_FAILURE, "open error\n");
-
     struct stat sb;
     if (fstat(fd, &sb) == -1)
         err(EXIT_FAILURE, "fstat error\n");
-    char* pswd = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    size_t file_length = sb.st_size;
+    if (file_length == 0) return false;
+
+    char *pswd = mmap(NULL, file_length, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (pswd == MAP_FAILED)
         err(EXIT_FAILURE, "mmap error\n");
-    
-    printf("First character: '%c'", pswd[0]);
-    munmap(pswd, sb.st_size);
+    const char *const start_file = pswd;
+    const char *const end_file = pswd + file_length;
+    size_t approx_pack_size = file_length / n_threads;
+    if (approx_pack_size == 0) approx_pack_size = 1;
+    printf("file_length = %lu\n", file_length);
+    printf("approximate pack size = %lu\n", approx_pack_size);
+    size_t next_start_pack_id = 0;
+    int spawned_threads = 0;
+    for (int i = 0; i < n_threads; i++)
+    {
+        size_t start_pack_id = next_start_pack_id;
+        size_t end_pack_id = (i + 1) * approx_pack_size - 1;
+        if (end_pack_id <= start_pack_id) continue;
+        if (start_pack_id >= file_length) break;
+        if (end_pack_id < file_length - 1 && pswd[end_pack_id] != '\n')
+        {
+            char *next_line = memchr(&pswd[end_pack_id], '\n', file_length - end_pack_id);
+            if (next_line != NULL && next_line != end_file - 1)
+                end_pack_id = next_line - start_file;
+            else
+            {
+                end_pack_id = file_length - 1;
+                i = n_threads - 1; //to stop after just that thread
+                printf("\n-----BREAKING AFTER %d----\n", i);
+            }
+        }
+        // if (i == n_threads - 1)
+        //     end_pack_id = file_length - 1;
+        printf("--- %d: [start_id: %lu] [end_id: %lu] [end == '\\n' ? %d] [start = '%c']\n", i, start_pack_id, end_pack_id,
+               pswd[end_pack_id] == '\n',
+               pswd[start_pack_id]);
+        spawned_threads++;
+        for (size_t j = start_pack_id; j <= end_pack_id; j++)
+        {
+            printf("%c", pswd[j]);
+        }
+        next_start_pack_id = end_pack_id + 1;
+    }
+    printf("\nSpawned Threads: %d\n", spawned_threads);
+    munmap(pswd, file_length);
     return false;
 }
 
@@ -86,14 +127,15 @@ int main(const int argc, char *argv[])
     char *pswd_path = NULL;
     int n_threads = -1;
     parse_argv(argc, argv, &salted_hash, &pswd_path, &n_threads);
-    const int max_threads = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    // const int max_threads = (int) sysconf(_SC_NPROCESSORS_ONLN);
     if (n_threads == -1)
     {
         //todo: find best nr of threads
+        //print progress after every thread tested. print_progress(i, max_threads)
     }
     else
     {
-        if (n_threads > max_threads) n_threads = max_threads;
+        // if (n_threads > max_threads) n_threads = max_threads;
         crack(salted_hash, pswd_path, n_threads);
     }
 
