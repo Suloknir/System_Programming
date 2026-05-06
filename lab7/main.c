@@ -1,19 +1,31 @@
 #include <stdio.h>
+#include <err.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include <crypt.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+// #include <crypt.h>
+// #include <time.h>
 
-void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_filename, int *ret_n_threads)
+void print_progress(size_t done, size_t to_do, const int max_bars)
 {
-    if (ret_hash == NULL || ret_filename == NULL || ret_n_threads == NULL)
-    {
-        fprintf(stderr, "parse_argv requires non-null arguments\n");
-        exit(EXIT_FAILURE);
-    }
-    *ret_hash = NULL;
-    *ret_filename = NULL;
-    *ret_n_threads = -1;
+    const float fraction_done = (float) done / to_do;
+    const int bars_to_print = fraction_done * max_bars;
+    printf("\r[");
+    for (int i = 0; i < bars_to_print; i++)
+        printf("=");
+    for (int i = 0; i < max_bars - bars_to_print; i++)
+        printf(" ");
+    printf("]%7.2f%%", fraction_done * 100);
+    fflush(stdout);
+}
+
+void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
+{
+    if (ret_hash == NULL || ret_filepath == NULL || ret_n_threads == NULL)
+        err(EXIT_FAILURE, "parse_argv requires non-null arguments\n");
     opterr = 0;
     int ret;
     while ((ret = getopt(argc, argv, "p:f:n:")) != -1)
@@ -24,27 +36,24 @@ void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_fi
                 *ret_hash = optarg;
                 break;
             case 'f':
-                *ret_filename = optarg;
+                *ret_filepath = optarg;
                 break;
             case 'n':
                 char *endptr;
                 const int val = (int) strtol(optarg, &endptr, 0);
                 if (endptr == optarg || val < 1)
-                {
-                    fprintf(stderr, "%s: option '%c' requires number >= 1 as an argument\n", argv[0], ret);
-                    exit(EXIT_FAILURE);
-                }
+                    err(EXIT_FAILURE, "%s: option '%c' requires number >= 1 as an argument\n", argv[0], ret);
                 *ret_n_threads = val;
                 break;
             case '?':
-                fprintf(stderr, "%s: Option '%c' requires argument\n", argv[0], optopt);
-                exit(EXIT_FAILURE);
+                err(EXIT_FAILURE, "%s: Option '%c' requires argument\n", argv[0], optopt);
+                // ReSharper disable once CppDFAUnreachableCode
                 break;
             default:
                 abort();
         }
     }
-    if (*ret_hash == NULL || *ret_filename == NULL)
+    if (*ret_hash == NULL || *ret_filepath == NULL)
     {
         fprintf(stderr, "Parameters 'p', 'f' are mandatory\n");
         fprintf(stderr, "Usage: %s -p [hashed password] -f [file] -n [n threads]\n", argv[0]);
@@ -52,13 +61,41 @@ void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_fi
     }
 }
 
+bool crack(const char *salted_hash, const char* pswd_path, int n_threads)
+{
+    int fd = open(pswd_path, O_RDONLY);
+    if (fd == -1)
+        err(EXIT_FAILURE, "open error\n");
+
+    struct stat sb;
+    if (fstat(fd, &sb) == -1)
+        err(EXIT_FAILURE, "fstat error\n");
+    char* pswd = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (pswd == MAP_FAILED)
+        err(EXIT_FAILURE, "mmap error\n");
+    
+    printf("First character: '%c'", pswd[0]);
+    munmap(pswd, sb.st_size);
+    return false;
+}
+
 int main(const int argc, char *argv[])
 {
-    char *hash_to_find, *pswd_file;
-    int n_threads;
-    parse_argv(argc, argv, &hash_to_find, &pswd_file, &n_threads);
-    printf("hash_to_find: %s\n", hash_to_find);
-    printf("file: %s\n", pswd_file);
-    printf("N_threads: %d\n", n_threads);
+    char *salted_hash = NULL;
+    char *pswd_path = NULL;
+    int n_threads = -1;
+    parse_argv(argc, argv, &salted_hash, &pswd_path, &n_threads);
+    const int max_threads = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    if (n_threads == -1)
+    {
+        //todo: find best nr of threads
+    }
+    else
+    {
+        if (n_threads > max_threads) n_threads = max_threads;
+        crack(salted_hash, pswd_path, n_threads);
+    }
+
     return 0;
 }
