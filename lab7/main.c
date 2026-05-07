@@ -23,10 +23,16 @@
 #define CRACK_ERR -1
 #endif
 
-struct ThreadArgs
+#ifndef CRACK_WORKER_ERR
+#define CRACK_WORKER_ERR ((void *) -1)
+#endif
+
+struct ThreadArg
 {
+    char *algorithm;
+    char *salt;
+    char *hash;
     const char *mapped;
-    const char *salted_hash;
     _Atomic size_t *progress;
 
     size_t length;
@@ -35,7 +41,7 @@ struct ThreadArgs
     bool stop_on_found;
 };
 
-void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
+void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
 {
     if (ret_hash == NULL || ret_filepath == NULL || ret_n_threads == NULL)
         err(EXIT_FAILURE, "parse_argv requires non-null arguments\n");
@@ -72,6 +78,24 @@ void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_fi
         fprintf(stderr, "Usage: %s -p [hashed password] -f [file] -n [n threads]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
+}
+
+void free_args(struct ThreadArg *to_free)
+{
+    free(to_free->algorithm);
+    free(to_free->salt);
+    free(to_free->hash);
+}
+
+/// splits string of type '$alg$salt$hash'
+void desalinate(const char *salted_hash, char **ret_alg, char **ret_salt, char **ret_hash)
+{
+    const char *alg = salted_hash + 1;
+    const char *salt = strchr(alg, '$') + 1;
+    const char *hash = strchr(salt, '$') + 1;
+    *ret_alg = strndup(alg, salt - alg - 1);
+    *ret_salt = strndup(salt, hash - salt - 1);
+    *ret_hash = strdup(hash);
 }
 
 void force_print_progress(size_t done, size_t to_do, int bars)
@@ -111,17 +135,41 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
 
 void *crack_worker(void *args)
 {
-    struct ThreadArgs th_args = *(struct ThreadArgs*)args;
-    size_t buff_len = 256;
-    char* buffer = malloc(buff_len * sizeof(char));
+    size_t buff_len = 64;
+    char *buffer = malloc(buff_len * sizeof(char));
     if (buffer == NULL)
-        err(EXIT_FAILURE, "malloc error\n");
-    printf("worker %d:\n", th_args.id);
-    for (size_t i = 0; i < th_args.length; i++)
     {
-        printf("%c", th_args.mapped[i]);
+        fprintf(stderr, "malloc error\n");
+        return CRACK_WORKER_ERR;
     }
-    //todo: return buffer if password found (maybe realloc also to shrink buffer size?)
+    struct ThreadArg th_args = *(struct ThreadArg*) args;
+    printf("%d: alg: [%s] salt: [%s], hash: [%s]\n", th_args.id, th_args.algorithm, th_args.salt, th_args.hash);
+
+    const char *current = th_args.mapped;
+    const char *end = &th_args.mapped[th_args.length - 1];
+    const char *line_end = NULL;
+    do
+    {
+        line_end = memchr(current, '\n', end - current + 1);
+        if (line_end == NULL)
+            line_end = end;
+        const size_t line_length = line_end - current + 1;
+        if (line_length > buff_len)
+        {
+            (buff_len * 2 > line_length) ? (buff_len *= 2) : (buff_len = line_length + 8);
+            char *new_buffer = realloc(buffer, buff_len * sizeof(char));
+            if (new_buffer == NULL)
+            {
+                free(buffer);
+                fprintf(stderr, "realloc error\n");
+                return CRACK_WORKER_ERR;
+            }
+            buffer = new_buffer;
+        }
+
+        atomic_fetch_add_explicit(th_args.progress, line_length, memory_order_relaxed);
+        current = line_end + 1;
+    } while (current <= end);
     free(buffer);
     return NULL;
 }
@@ -160,7 +208,7 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
     printf("file_length = %lu\n", file_length);
     printf("approx_pack_size = %lu\n", approx_pack_size);
     // print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, 30, 36);
-    struct ThreadArgs *args = calloc(n_threads, sizeof(struct ThreadArgs));
+    struct ThreadArg *args = calloc(n_threads, sizeof(struct ThreadArg));
     if (args == NULL)
     {
         fprintf(stderr, "calloc error\n");
@@ -176,7 +224,7 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
     }
 
     _Atomic size_t progress = 0;
-    size_t main_tid = pthread_self();
+    const size_t main_tid = pthread_self();
     size_t next_start_id = 0;
     int created = 0;
     for (int i = 0; i < n_threads; i++)
@@ -194,9 +242,9 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
                 continue;
             if (pack_end_id < file_length - 1 && mapped[pack_end_id] != '\n')
             {
-                const char *next_line = memchr(&mapped[pack_end_id], '\n', file_length - pack_end_id);
-                if (next_line != NULL)
-                    pack_end_id = next_line - mapped;
+                const char *line_end = memchr(&mapped[pack_end_id], '\n', file_length - pack_end_id);
+                if (line_end != NULL)
+                    pack_end_id = line_end - mapped;
                 else
                 {
                     pack_end_id = file_length - 1;
@@ -205,34 +253,34 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
             }
         }
         next_start_id = pack_end_id + 1;
-
+        desalinate(salted_hash, &args[created].algorithm, &args[created].salt, &args[created].hash);
         args[created].mapped = mapped + pack_start_id;
-        args[created].salted_hash = salted_hash;
         args[created].progress = &progress;
         args[created].length = pack_end_id - pack_start_id + 1;
         args[created].main_tid = main_tid;
         args[created].id = created;
         args[created].stop_on_found = true;
-        // args[i].created = true;
-        pthread_create(&threads[created], NULL, crack_worker, &args[created]);
-        // printf("--- %d: [start_id: %lu] [end_id: %lu] [pack_size = %lu] [end == '\\n' ? %d] [start = '%c']\n",
-        //        i,
-        //        pack_start_id,
-        //        pack_end_id,
-        //        pack_end_id - pack_start_id,
-        //        mapped[pack_end_id] == '\n',
-        //        mapped[pack_start_id]);
-        // for (size_t j = pack_start_id; j <= pack_end_id; j++)
-        // {
-        //     printf("%c", mapped[j]);
-        //     // print_progress(j - pack_start_id, pack_end_id - pack_start_id, 30, 1.5f);
-        // }
+        if (pthread_create(&threads[created], NULL, crack_worker, &args[created]) != 0)
+        {
+            fprintf(stderr, "pthread_create error\n");
+            for (int j = 0; j < created; j++)
+            {
+                pthread_join(threads[j], NULL);
+                free_args(&args[j]);
+            }
+            free_args(&args[created]);
+            free(args);
+            free(threads);
+            return CRACK_ERR;
+        }
         created++;
     }
     for (int i = 0; i < created; i++)
     {
-        //todo: check if that saves data to ret_found
-        pthread_join(threads[i], (void**)ret_found);
+        pthread_join(threads[i], (void**) ret_found);
+        free_args(&args[i]);
+        // printf("%lu finished with return: %s\n", threads[i], *ret_found);
+        // printf("done: %lu, to_do: %lu\n", atomic_load_explicit(&progress, memory_order_relaxed), file_length);
     }
 
     // printf("\nCreated Threads: %d\n", created_threads);
