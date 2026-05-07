@@ -9,7 +9,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
-// #include <crypt.h>
+#include <crypt.h>
 
 #ifndef CRACK_FOUND
 #define CRACK_FOUND 1
@@ -80,16 +80,18 @@ void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath
     }
 }
 
-void free_args(struct ThreadArg *to_free)
+void free_arg(struct ThreadArg *to_free)
 {
     free(to_free->algorithm);
     free(to_free->salt);
     free(to_free->hash);
 }
 
-/// splits string of type '$alg$salt$hash'
+/// splits string of type '$alg$salt$hash'.\n
+/// ret_... values should be freed manually
 void desalinate(const char *salted_hash, char **ret_alg, char **ret_salt, char **ret_hash)
 {
+    //todo: error checking
     const char *alg = salted_hash + 1;
     const char *salt = strchr(alg, '$') + 1;
     const char *hash = strchr(salt, '$') + 1;
@@ -174,8 +176,8 @@ void *crack_worker(void *args)
     return NULL;
 }
 
-/// If 'CRACK_FOUND' was returned, memory allocated in '*ret_found' should be freed manually.
-/// If 'CRACK_NOT_FOUND' was returned, '*ret_found' is equal to NULL.
+/// If 'CRACK_FOUND' was returned, memory allocated in '*ret_found' should be freed manually.\n
+/// If 'CRACK_NOT_FOUND' was returned, '*ret_found' is equal to NULL.\n
 /// Otherwise, '*ret_found' value is undefined.
 short crack(const char *salted_hash, const char *pswd_path, int n_threads, char **ret_found)
 {
@@ -266,9 +268,9 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
             for (int j = 0; j < created; j++)
             {
                 pthread_join(threads[j], NULL);
-                free_args(&args[j]);
+                free_arg(&args[j]);
             }
-            free_args(&args[created]);
+            free_arg(&args[created]);
             free(args);
             free(threads);
             return CRACK_ERR;
@@ -278,7 +280,7 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
     for (int i = 0; i < created; i++)
     {
         pthread_join(threads[i], (void**) ret_found);
-        free_args(&args[i]);
+        free_arg(&args[i]);
         // printf("%lu finished with return: %s\n", threads[i], *ret_found);
         // printf("done: %lu, to_do: %lu\n", atomic_load_explicit(&progress, memory_order_relaxed), file_length);
     }
