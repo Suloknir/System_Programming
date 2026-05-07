@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 // #include <crypt.h>
 
 #ifndef CRACK_FOUND
@@ -20,6 +22,18 @@
 #ifndef CRACK_ERR
 #define CRACK_ERR -1
 #endif
+
+struct ThreadArgs
+{
+    const char *mapped;
+    const char *salted_hash;
+    _Atomic size_t *progress;
+
+    size_t length;
+    pthread_t main_tid;
+    int id;
+    bool stop_on_found;
+};
 
 void parse_argv(const int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
 {
@@ -95,10 +109,26 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
     }
 }
 
-void thread_crack(int id, const char *mapped, size_t length) {}
+void *crack_worker(void *args)
+{
+    struct ThreadArgs th_args = *(struct ThreadArgs*)args;
+    size_t buff_len = 256;
+    char* buffer = malloc(buff_len * sizeof(char));
+    if (buffer == NULL)
+        err(EXIT_FAILURE, "malloc error\n");
+    printf("worker %d:\n", th_args.id);
+    for (size_t i = 0; i < th_args.length; i++)
+    {
+        printf("%c", th_args.mapped[i]);
+    }
+    //todo: return buffer if password found (maybe realloc also to shrink buffer size?)
+    free(buffer);
+    return NULL;
+}
 
-/// If 'CRACK_FOUND' was returned, memory allocated in 'ret found' should be freed manually.
-/// Otherwise, ret_found is not set at all.
+/// If 'CRACK_FOUND' was returned, memory allocated in '*ret_found' should be freed manually.
+/// If 'CRACK_NOT_FOUND' was returned, '*ret_found' is equal to NULL.
+/// Otherwise, '*ret_found' value is undefined.
 short crack(const char *salted_hash, const char *pswd_path, int n_threads, char **ret_found)
 {
     const int fd = open(pswd_path, O_RDONLY);
@@ -129,8 +159,26 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
         approx_pack_size = 1;
     printf("file_length = %lu\n", file_length);
     printf("approx_pack_size = %lu\n", approx_pack_size);
-    int created_threads = 0;
+    // print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, 30, 36);
+    struct ThreadArgs *args = calloc(n_threads, sizeof(struct ThreadArgs));
+    if (args == NULL)
+    {
+        fprintf(stderr, "calloc error\n");
+        return CRACK_ERR;
+    }
+
+    pthread_t *threads = malloc(n_threads * sizeof(pthread_t));
+    if (threads == NULL)
+    {
+        free(args);
+        fprintf(stderr, "calloc error\n");
+        return CRACK_ERR;
+    }
+
+    _Atomic size_t progress = 0;
+    size_t main_tid = pthread_self();
     size_t next_start_id = 0;
+    int created = 0;
     for (int i = 0; i < n_threads; i++)
     {
         const size_t pack_start_id = next_start_id;
@@ -157,23 +205,40 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
             }
         }
         next_start_id = pack_end_id + 1;
-        printf("--- %d: [start_id: %lu] [end_id: %lu] [pack_size = %lu] [end == '\\n' ? %d] [start = '%c']\n",
-               i,
-               pack_start_id,
-               pack_end_id,
-               pack_end_id - pack_start_id,
-               mapped[pack_end_id] == '\n',
-               mapped[pack_start_id]);
-        for (size_t j = pack_start_id; j <= pack_end_id; j++)
-        {
-            printf("%c", mapped[j]);
-            // print_progress(j - pack_start_id, pack_end_id - pack_start_id, 30, 1.5f);
-        }
 
-        created_threads++;
+        args[created].mapped = mapped + pack_start_id;
+        args[created].salted_hash = salted_hash;
+        args[created].progress = &progress;
+        args[created].length = pack_end_id - pack_start_id + 1;
+        args[created].main_tid = main_tid;
+        args[created].id = created;
+        args[created].stop_on_found = true;
+        // args[i].created = true;
+        pthread_create(&threads[created], NULL, crack_worker, &args[created]);
+        // printf("--- %d: [start_id: %lu] [end_id: %lu] [pack_size = %lu] [end == '\\n' ? %d] [start = '%c']\n",
+        //        i,
+        //        pack_start_id,
+        //        pack_end_id,
+        //        pack_end_id - pack_start_id,
+        //        mapped[pack_end_id] == '\n',
+        //        mapped[pack_start_id]);
+        // for (size_t j = pack_start_id; j <= pack_end_id; j++)
+        // {
+        //     printf("%c", mapped[j]);
+        //     // print_progress(j - pack_start_id, pack_end_id - pack_start_id, 30, 1.5f);
+        // }
+        created++;
     }
-    printf("\nCreated Threads: %d\n", created_threads);
+    for (int i = 0; i < created; i++)
+    {
+        //todo: check if that saves data to ret_found
+        pthread_join(threads[i], (void**)ret_found);
+    }
+
+    // printf("\nCreated Threads: %d\n", created_threads);
     munmap(mapped, file_length);
+    free(args);
+    free(threads);
     return CRACK_NOT_FOUND;
 }
 
@@ -191,7 +256,7 @@ int main(const int argc, char *argv[])
     }
     else
     {
-        // if (n_threads > max_threads) n_threads = max_threads;
+        if (n_threads > max_threads) n_threads = max_threads;
         char *found_pass = NULL;
         switch (crack(salted_hash, pswd_path, n_threads, &found_pass))
         {
@@ -203,8 +268,7 @@ int main(const int argc, char *argv[])
                 printf("Password not found\n");
                 break;
             case CRACK_ERR:
-                fprintf(stderr, "crack_error\n");
-                exit(EXIT_FAILURE);
+                err(EXIT_FAILURE, "crack_error\n");
                 // ReSharper disable once CppDFAUnreachableCode
                 break;
             default:
