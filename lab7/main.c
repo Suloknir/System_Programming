@@ -29,26 +29,22 @@
 #define CRACK_WORKER_ERR ((void *) -1)
 #endif
 
-struct ThreadArg
+struct ThreadInfo
 {
     char *alg;
     char *salt;
     char *hash;
     const char *mapped;
-    bool *report_stopped;
+    _Atomic bool *report_found;
     _Atomic size_t *progress;
 
     size_t length;
+    pthread_t tid;
+    bool stopped;
     // pthread_t main_tid;
     // int id;
     bool stop_on_found;
     bool force_stop;
-};
-
-struct ThreadInfo
-{
-    pthread_t tid;
-    bool stopped;
 };
 
 void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
@@ -90,7 +86,7 @@ void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath
     }
 }
 
-void free_arg(struct ThreadArg *to_free)
+void free_arg(struct ThreadInfo *to_free)
 {
     if (to_free->alg != NULL)
         free(to_free->alg);
@@ -164,16 +160,15 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
 
 void worker_exit_handler(void *args)
 {
-    // printf("destructor\n");
-    if (((struct ThreadArg*) args)->report_stopped != NULL)
-        *((struct ThreadArg*) args)->report_stopped = true;
-    // printf("Set stopped to %d\n", *((struct ThreadArg*) args)->report_stopped);
+    ((struct ThreadInfo*) args)->stopped = true;
+    // printf("Set stopped to %d\n", ((struct ThreadInfo*) args)->stopped = true);
 }
 
 void *crack_worker(void *args)
 {
-    pthread_cleanup_push(worker_exit_handler, args)
-        ;
+    // @formatter:off
+    pthread_cleanup_push(worker_exit_handler, args);
+        // @formatter:on
         size_t buff_len = 64;
         char *buffer = malloc(buff_len * sizeof *buffer);
         if (buffer == NULL)
@@ -183,15 +178,15 @@ void *crack_worker(void *args)
         }
         // pthread_exit(buffer);
         // printf("%d:salt: [%s], hash: [%s]\n", th_args.id, th_args.salt, th_args.hash);
-        const struct ThreadArg th_args = *(struct ThreadArg*) args;
-        const size_t target_size = strlen(th_args.salt) + strlen(th_args.hash) + 2 * sizeof(char);
+        const struct ThreadInfo* th_info = args;
+        const size_t target_size = strlen(th_info->salt) + strlen(th_info->hash) + 2 * sizeof(char);
         char target_hashed[target_size];
-        snprintf(target_hashed, target_size, "%s$%s", th_args.salt, th_args.hash);
+        snprintf(target_hashed, target_size, "%s$%s", th_info->salt, th_info->hash);
         // printf("%d: target [%s]\n", th_args.id, target);
         struct crypt_data data;
         data.initialized = 0;
-        const char *current = th_args.mapped;
-        const char *end = &th_args.mapped[th_args.length - 1];
+        const char *current = th_info->mapped;
+        const char *end = &th_info->mapped[th_info->length - 1];
         const char *line_end = NULL;
         do
         {
@@ -216,13 +211,18 @@ void *crack_worker(void *args)
                 buffer[line_length - 1] = '\0';
             else
                 buffer[line_length] = '\0';
-            const char *hashed = crypt_r(buffer, th_args.salt, &data);
-            if (strcmp(target_hashed, hashed) == 0) //todo: check if stop on found
-                pthread_exit(buffer);
+            const char *hashed = crypt_r(buffer, th_info->salt, &data);
+            if (strcmp(target_hashed, hashed) == 0)
+            {
+                atomic_store_explicit(th_info->report_found, true, memory_order_relaxed);
+                // printf("%lu found password\n", th_info->tid);
+                if (th_info->stop_on_found)
+                    pthread_exit(buffer);
+            }
 
-            atomic_fetch_add_explicit(th_args.progress, line_length, memory_order_relaxed);
+            atomic_fetch_add_explicit(th_info->progress, line_length, memory_order_relaxed);
             current = line_end + 1;
-        } while (current <= end && !th_args.force_stop);
+        } while (current <= end && !th_info->force_stop);
         free(buffer);
         pthread_exit(NULL);
     pthread_cleanup_pop(0);
@@ -261,23 +261,15 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
         approx_pack_size = 1;
     // printf("file_length = %lu\n", file_length);
     // printf("approx_pack_size = %lu\n", approx_pack_size);
-    // print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, 30, 36);
-    struct ThreadArg *args = calloc(n_threads, sizeof *args);
-    if (args == NULL)
+    struct ThreadInfo *th_info = calloc(n_threads, sizeof *th_info);
+    if (th_info == NULL)
     {
         fprintf(stderr, "calloc error\n");
         return CRACK_ERR;
     }
 
-    struct ThreadInfo *threads = malloc(n_threads * sizeof *threads);
-    if (threads == NULL)
-    {
-        free(args);
-        fprintf(stderr, "malloc error\n");
-        return CRACK_ERR;
-    }
-
     _Atomic size_t progress = 0;
+    _Atomic bool found = false;
     // const size_t main_tid = pthread_self();
     size_t next_start_id = 0;
     int created = 0;
@@ -307,62 +299,74 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
             }
         }
         next_start_id = pack_end_id + 1;
-
-        threads[created].stopped = false;
-        args[created].report_stopped = &threads[created].stopped;
-        // desalinate(salted_hash, &args[created].alg, &args[created].salt, &args[created].hash);
-        desalinate2(salted_hash, &args[created].salt, &args[created].hash);
-        args[created].mapped = mapped + pack_start_id;
-        args[created].progress = &progress;
-        args[created].length = pack_end_id - pack_start_id + 1;
+        desalinate2(salted_hash, &th_info[created].salt, &th_info[created].hash);
+        th_info[created].mapped = mapped + pack_start_id;
+        th_info[created].report_found = &found;
+        th_info[created].progress = &progress;
+        th_info[created].length = pack_end_id - pack_start_id + 1;
+        th_info[created].stopped = false;
+        th_info[created].force_stop = false;
         // args[created].main_tid = main_tid;
         // args[created].id = created;
-        args[created].stop_on_found = true;
-        if (pthread_create(&threads[created].tid, NULL, crack_worker, &args[created]) != 0)
+        th_info[created].stop_on_found = true;
+        if (pthread_create(&th_info[created].tid, NULL, crack_worker, &th_info[created]) != 0)
         {
             fprintf(stderr, "pthread_create error\n");
             for (int j = 0; j < created; j++)
             {
-                pthread_join(threads[j].tid, NULL);
-                free_arg(&args[j]);
+                pthread_join(th_info[j].tid, NULL);
+                free_arg(&th_info[j]);
             }
-            free_arg(&args[created]);
-            free(args);
-            free(threads);
+            free_arg(&th_info[created]);
+            free(th_info);
+            // free(threads);
             return CRACK_ERR;
         }
         created++;
     }
-    // int threads_stopped = 0;
-    // while (threads_stopped < created)
-    // {
-    //     for (int i = 0; i < created; i++)
-    //     {
-    //         threads_stopped++;
-    //     }
-    // }
 
-    bool is_found = false;
-    char *found_password = NULL;
+    const float print_fps = 24.0f;
+    const int bars = 30;
+    int threads_stopped = 0;
+    while (threads_stopped < created)
+    {
+        print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, bars, print_fps);
+        threads_stopped = 0;
+        if (atomic_load_explicit(&found, memory_order_relaxed))
+        {
+            // printf("force stopping\n");
+            for (int i = 0; i < created; i++)
+            {
+                th_info[i].force_stop = true;
+                // printf("%d, force stop = %d\n", i, th_info[i].force_stop);
+            }
+        }
+        for (int i = 0; i < created; i++)
+        {
+            if (th_info[i].stopped == true)
+            {
+                threads_stopped++;
+            }
+        }
+    }
+
+    char *found_pswd = NULL;
     for (int i = 0; i < created; i++)
     {
-        pthread_join(threads[i].tid, (void**) &found_password);
+        pthread_join(th_info[i].tid, (void**) &found_pswd);
         // printf("ret_found: [%s]", *ret_found);
-        free_arg(&args[i]);
-        if (found_password != NULL)
-        {
-            is_found = true;
-            *ret_found = found_password;
-        }
+        free_arg(&th_info[i]);
+        if (found_pswd != NULL)
+            *ret_found = found_pswd;
         // printf("%lu finished with return: %s\n", threads[i], *ret_found);
         // printf("done: %lu, to_do: %lu\n", atomic_load_explicit(&progress, memory_order_relaxed), file_length);
     }
 
-    // printf("\nCreated Threads: %d\n", created_threads);
     munmap(mapped, file_length);
-    free(args);
-    free(threads);
-    if (is_found)
+    free(th_info);
+    print_progress(1, 1, bars, print_fps);
+    printf("\n");
+    if (found)
         return CRACK_FOUND;
     else
     {
