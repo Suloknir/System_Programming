@@ -1,4 +1,6 @@
-#define _POSIX_C_SOURCE 199309L
+// compilation:
+// gcc ./main.c -O3 -std=c17 -o main -lpthread -lcrypt
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdbool.h>
 #include <err.h>
