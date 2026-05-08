@@ -11,6 +11,10 @@
 #include <stdatomic.h>
 #include <crypt.h>
 
+#ifndef EASY_ON_CPU
+#define EASY_ON_CPU true
+#endif
+
 #ifndef CRACK_FOUND
 #define CRACK_FOUND 1
 #endif
@@ -38,11 +42,9 @@ struct ThreadInfo
 
     size_t length;
     pthread_t tid;
-    bool stopped;
-    // pthread_t main_tid;
-    // int id;
-    bool stop_on_found;
-    bool force_stop;
+    _Atomic bool stopped;
+    _Atomic bool stop_on_found;
+    _Atomic bool force_stop;
 };
 
 void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
@@ -62,12 +64,14 @@ void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath
                 *ret_filepath = optarg;
                 break;
             case 'n':
+            {
                 char *endptr;
                 const int val = (int) strtol(optarg, &endptr, 0);
                 if (endptr == optarg || val < 1)
                     err(EXIT_FAILURE, "%s: option '%c' requires number >= 1 as an argument\n", argv[0], ret);
                 *ret_n_threads = val;
                 break;
+            }
             case '?':
                 err(EXIT_FAILURE, "%s: Option '%c' requires argument\n", argv[0], optopt);
                 // ReSharper disable once CppDFAUnreachableCode
@@ -134,7 +138,7 @@ void force_print_progress(size_t done, size_t to_do, int bars)
     fflush(stdout);
 }
 
-void print_progress(size_t done, size_t to_do, int bars, float fps)
+void print_progress(size_t done, size_t to_do, int bars, float refresh_rate)
 {
     static bool already_printed = false;
     static struct timespec last_print;
@@ -149,7 +153,7 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
     clock_gettime(CLOCK_MONOTONIC, &now);
     const float elapsed = (float) (now.tv_sec - last_print.tv_sec) +
                           (float) (now.tv_nsec - last_print.tv_nsec) / 1e9;
-    if (elapsed >= 1.0f / fps)
+    if (elapsed >= 1.0f / refresh_rate)
     {
         clock_gettime(CLOCK_MONOTONIC, &last_print);
         force_print_progress(done, to_do, bars);
@@ -158,7 +162,8 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
 
 void worker_exit_handler(void *args)
 {
-    ((struct ThreadInfo*) args)->stopped = true;
+    // ((struct ThreadInfo*) args)->stopped = true;
+    atomic_store_explicit(&((struct ThreadInfo*) args)->stopped, true, memory_order_relaxed);
 }
 
 void *crack_worker(void *args)
@@ -210,7 +215,7 @@ void *crack_worker(void *args)
             const char *hashed = crypt_r(buffer, th_info->salt, &data);
             if (strcmp(target_hashed, hashed) == 0)
             {
-                if (th_info->stop_on_found)
+                if (atomic_load_explicit(&th_info->stop_on_found, memory_order_relaxed))
                 {
                     atomic_store_explicit(th_info->report_found, true, memory_order_relaxed);
                     pthread_exit(buffer);
@@ -230,7 +235,7 @@ void *crack_worker(void *args)
 
             atomic_fetch_add_explicit(th_info->progress, line_length, memory_order_relaxed);
             current = line_end + 1;
-        } while (current <= end && !th_info->force_stop);
+        } while (current <= end && !atomic_load_explicit(&th_info->force_stop, memory_order_relaxed));
 
         free(buffer);
         if (exit_found_flag)
@@ -293,6 +298,7 @@ short crack(const char *salted_hash,
     if (th_info == NULL)
     {
         fprintf(stderr, "calloc error\n");
+        munmap(mapped, file_length);
         return CRACK_ERR;
     }
 
@@ -347,31 +353,33 @@ short crack(const char *salted_hash,
             }
             free_arg(&th_info[created]);
             free(th_info);
-            // free(threads);
+            munmap(mapped, file_length);
             return CRACK_ERR;
         }
         created++;
     }
 
-    const float print_fps = 24.0f;
+    const float refresh_rate = 24.0f;
     const int bars = 30;
     int threads_stopped = 0;
     while (threads_stopped < created)
     {
-        print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, bars, print_fps);
+        print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, bars, refresh_rate);
+        #if EASY_ON_CPU == true
+        const struct timespec loop_sleep = {0, 1000000}; //1 ms sleep to not drain CPU
+        nanosleep(&loop_sleep, NULL);
+        #endif
         threads_stopped = 0;
         if (atomic_load_explicit(&found, memory_order_relaxed))
         {
-            // printf("force stopping\n");
             for (int i = 0; i < created; i++)
             {
-                th_info[i].force_stop = true;
-                // printf("%d, force stop = %d\n", i, th_info[i].force_stop);
+                atomic_store_explicit(&th_info[i].force_stop, true, memory_order_relaxed);
             }
         }
         for (int i = 0; i < created; i++)
         {
-            if (th_info[i].stopped == true)
+            if (atomic_load_explicit(&th_info[i].stopped, memory_order_relaxed))
             {
                 threads_stopped++;
             }
@@ -382,17 +390,24 @@ short crack(const char *salted_hash,
     for (int i = 0; i < created; i++)
     {
         pthread_join(th_info[i].tid, (void**) &found_pswd);
-        // printf("ret_found: [%s]", *ret_found);
         free_arg(&th_info[i]);
-        if (found_pswd != NULL && ret_found != NULL)
-            *ret_found = found_pswd;
-        // printf("%lu finished with return: %s\n", threads[i], *ret_found);
-        // printf("done: %lu, to_do: %lu\n", atomic_load_explicit(&progress, memory_order_relaxed), file_length);
+        if (found_pswd == CRACK_WORKER_ERR)
+        {
+            fprintf(stderr, "worker error\n");
+            continue;
+        }
+        if (found_pswd != NULL)
+        {
+            if (ret_found != NULL && *ret_found == NULL)
+                *ret_found = found_pswd;
+            else
+                free(found_pswd);
+        }
     }
 
     munmap(mapped, file_length);
     free(th_info);
-    print_progress(1, 1, bars, print_fps);
+    print_progress(1, 1, bars, refresh_rate);
     // printf("\n");
     if (found)
         return CRACK_FOUND;
