@@ -1,4 +1,6 @@
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
+#include <stdbool.h>
 #include <err.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -10,6 +12,9 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <crypt.h>
+
+extern char *optarg;
+extern int opterr, optopt;
 
 #ifndef EASY_ON_CPU
 #define EASY_ON_CPU true
@@ -366,7 +371,7 @@ short crack(const char *salted_hash,
     {
         print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, bars, refresh_rate);
         #if EASY_ON_CPU == true
-        const struct timespec loop_sleep = {0, 1000000}; //1 ms sleep to not drain CPU
+        const struct timespec loop_sleep = {0, 1000000};
         nanosleep(&loop_sleep, NULL);
         #endif
         threads_stopped = 0;
