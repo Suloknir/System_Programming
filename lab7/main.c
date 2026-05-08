@@ -35,12 +35,20 @@ struct ThreadArg
     char *salt;
     char *hash;
     const char *mapped;
+    bool *report_stopped;
     _Atomic size_t *progress;
 
     size_t length;
-    pthread_t main_tid;
-    int id;
+    // pthread_t main_tid;
+    // int id;
     bool stop_on_found;
+    bool force_stop;
+};
+
+struct ThreadInfo
+{
+    pthread_t tid;
+    bool stopped;
 };
 
 void parse_argv(int argc, char *const*argv, char **ret_hash, char **ret_filepath, int *ret_n_threads)
@@ -106,7 +114,6 @@ void desalinate(const char *salted_hash, char **ret_alg, char **ret_salt, char *
     *ret_hash = strdup(hash);
 }
 
-
 /// splits string of type '$alg$salt$hash'.\n
 /// ret_... values should be freed manually
 /// on success ret_salt = '$alg$salt', ret_hash = hash
@@ -155,58 +162,70 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
     }
 }
 
+void worker_exit_handler(void *args)
+{
+    // printf("destructor\n");
+    if (((struct ThreadArg*) args)->report_stopped != NULL)
+        *((struct ThreadArg*) args)->report_stopped = true;
+    // printf("Set stopped to %d\n", *((struct ThreadArg*) args)->report_stopped);
+}
+
 void *crack_worker(void *args)
 {
-    size_t buff_len = 64;
-    char *buffer = malloc(buff_len * sizeof(char));
-    if (buffer == NULL)
-    {
-        fprintf(stderr, "malloc error\n");
-        return CRACK_WORKER_ERR;
-    }
-    struct ThreadArg th_args = *(struct ThreadArg*) args;
-    // printf("%d:salt: [%s], hash: [%s]\n", th_args.id, th_args.salt, th_args.hash);
-    const size_t target_size = strlen(th_args.salt) + strlen(th_args.hash) + 2 * sizeof(char);
-    char target_hashed[target_size];
-    snprintf(target_hashed, target_size, "%s$%s", th_args.salt, th_args.hash);
-    // printf("%d: target [%s]\n", th_args.id, target);
-    struct crypt_data data;
-    data.initialized = 0;
-    const char *current = th_args.mapped;
-    const char *end = &th_args.mapped[th_args.length - 1];
-    const char *line_end = NULL;
-    do
-    {
-        line_end = memchr(current, '\n', end - current + 1);
-        if (line_end == NULL)
-            line_end = end;
-        const size_t line_length = line_end - current + 1;
-        if (line_length >= buff_len)
+    pthread_cleanup_push(worker_exit_handler, args)
+        ;
+        size_t buff_len = 64;
+        char *buffer = malloc(buff_len * sizeof *buffer);
+        if (buffer == NULL)
         {
-            (buff_len * 2 > line_length) ? (buff_len *= 2) : (buff_len = line_length + 8);
-            char *new_buffer = realloc(buffer, buff_len * sizeof(char));
-            if (new_buffer == NULL)
-            {
-                free(buffer);
-                fprintf(stderr, "realloc error\n");
-                return CRACK_WORKER_ERR;
-            }
-            buffer = new_buffer;
+            fprintf(stderr, "malloc error\n");
+            pthread_exit(CRACK_WORKER_ERR);
         }
-        strncpy(buffer, current, line_length);
-        if (buffer[line_length - 1] == '\n')
-            buffer[line_length - 1] = '\0';
-        else
-            buffer[line_length] = '\0';
-        const char *hashed = crypt_r(buffer, th_args.salt, &data);
-        if (strcmp(target_hashed, hashed) == 0)
-            return buffer;
+        // pthread_exit(buffer);
+        // printf("%d:salt: [%s], hash: [%s]\n", th_args.id, th_args.salt, th_args.hash);
+        const struct ThreadArg th_args = *(struct ThreadArg*) args;
+        const size_t target_size = strlen(th_args.salt) + strlen(th_args.hash) + 2 * sizeof(char);
+        char target_hashed[target_size];
+        snprintf(target_hashed, target_size, "%s$%s", th_args.salt, th_args.hash);
+        // printf("%d: target [%s]\n", th_args.id, target);
+        struct crypt_data data;
+        data.initialized = 0;
+        const char *current = th_args.mapped;
+        const char *end = &th_args.mapped[th_args.length - 1];
+        const char *line_end = NULL;
+        do
+        {
+            line_end = memchr(current, '\n', end - current + 1);
+            if (line_end == NULL)
+                line_end = end;
+            const size_t line_length = line_end - current + 1;
+            if (line_length >= buff_len)
+            {
+                (buff_len * 2 > line_length) ? (buff_len *= 2) : (buff_len = line_length + 8);
+                char *new_buffer = realloc(buffer, buff_len * sizeof *new_buffer);
+                if (new_buffer == NULL)
+                {
+                    free(buffer);
+                    fprintf(stderr, "realloc error\n");
+                    pthread_exit(CRACK_WORKER_ERR);
+                }
+                buffer = new_buffer;
+            }
+            strncpy(buffer, current, line_length);
+            if (buffer[line_length - 1] == '\n')
+                buffer[line_length - 1] = '\0';
+            else
+                buffer[line_length] = '\0';
+            const char *hashed = crypt_r(buffer, th_args.salt, &data);
+            if (strcmp(target_hashed, hashed) == 0) //todo: check if stop on found
+                pthread_exit(buffer);
 
-        atomic_fetch_add_explicit(th_args.progress, line_length, memory_order_relaxed);
-        current = line_end + 1;
-    } while (current <= end);
-    free(buffer);
-    return NULL;
+            atomic_fetch_add_explicit(th_args.progress, line_length, memory_order_relaxed);
+            current = line_end + 1;
+        } while (current <= end && !th_args.force_stop);
+        free(buffer);
+        pthread_exit(NULL);
+    pthread_cleanup_pop(0);
 }
 
 /// If 'CRACK_FOUND' was returned, memory allocated in '*ret_found' should be freed manually.\n
@@ -243,23 +262,23 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
     // printf("file_length = %lu\n", file_length);
     // printf("approx_pack_size = %lu\n", approx_pack_size);
     // print_progress(atomic_load_explicit(&progress, memory_order_relaxed), file_length, 30, 36);
-    struct ThreadArg *args = calloc(n_threads, sizeof(struct ThreadArg));
+    struct ThreadArg *args = calloc(n_threads, sizeof *args);
     if (args == NULL)
     {
         fprintf(stderr, "calloc error\n");
         return CRACK_ERR;
     }
 
-    pthread_t *threads = malloc(n_threads * sizeof(pthread_t));
+    struct ThreadInfo *threads = malloc(n_threads * sizeof *threads);
     if (threads == NULL)
     {
         free(args);
-        fprintf(stderr, "calloc error\n");
+        fprintf(stderr, "malloc error\n");
         return CRACK_ERR;
     }
 
     _Atomic size_t progress = 0;
-    const size_t main_tid = pthread_self();
+    // const size_t main_tid = pthread_self();
     size_t next_start_id = 0;
     int created = 0;
     for (int i = 0; i < n_threads; i++)
@@ -288,20 +307,23 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
             }
         }
         next_start_id = pack_end_id + 1;
+
+        threads[created].stopped = false;
+        args[created].report_stopped = &threads[created].stopped;
         // desalinate(salted_hash, &args[created].alg, &args[created].salt, &args[created].hash);
         desalinate2(salted_hash, &args[created].salt, &args[created].hash);
         args[created].mapped = mapped + pack_start_id;
         args[created].progress = &progress;
         args[created].length = pack_end_id - pack_start_id + 1;
-        args[created].main_tid = main_tid;
-        args[created].id = created;
+        // args[created].main_tid = main_tid;
+        // args[created].id = created;
         args[created].stop_on_found = true;
-        if (pthread_create(&threads[created], NULL, crack_worker, &args[created]) != 0)
+        if (pthread_create(&threads[created].tid, NULL, crack_worker, &args[created]) != 0)
         {
             fprintf(stderr, "pthread_create error\n");
             for (int j = 0; j < created; j++)
             {
-                pthread_join(threads[j], NULL);
+                pthread_join(threads[j].tid, NULL);
                 free_arg(&args[j]);
             }
             free_arg(&args[created]);
@@ -311,11 +333,20 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
         }
         created++;
     }
+    // int threads_stopped = 0;
+    // while (threads_stopped < created)
+    // {
+    //     for (int i = 0; i < created; i++)
+    //     {
+    //         threads_stopped++;
+    //     }
+    // }
+
     bool is_found = false;
-    char* found_password = NULL;
+    char *found_password = NULL;
     for (int i = 0; i < created; i++)
     {
-        pthread_join(threads[i], (void**)&found_password);
+        pthread_join(threads[i].tid, (void**) &found_password);
         // printf("ret_found: [%s]", *ret_found);
         free_arg(&args[i]);
         if (found_password != NULL)
