@@ -1,5 +1,3 @@
-// todo: change in all allocs sizeof(type) to sizeof *name.
-// todo: communication when thread finds a password
 #include <stdio.h>
 #include <err.h>
 #include <unistd.h>
@@ -161,7 +159,6 @@ void print_progress(size_t done, size_t to_do, int bars, float fps)
 void worker_exit_handler(void *args)
 {
     ((struct ThreadInfo*) args)->stopped = true;
-    // printf("Set stopped to %d\n", ((struct ThreadInfo*) args)->stopped = true);
 }
 
 void *crack_worker(void *args)
@@ -176,18 +173,17 @@ void *crack_worker(void *args)
             fprintf(stderr, "malloc error\n");
             pthread_exit(CRACK_WORKER_ERR);
         }
-        // pthread_exit(buffer);
-        // printf("%d:salt: [%s], hash: [%s]\n", th_args.id, th_args.salt, th_args.hash);
-        const struct ThreadInfo* th_info = args;
+        const struct ThreadInfo *th_info = args;
         const size_t target_size = strlen(th_info->salt) + strlen(th_info->hash) + 2 * sizeof(char);
         char target_hashed[target_size];
         snprintf(target_hashed, target_size, "%s$%s", th_info->salt, th_info->hash);
-        // printf("%d: target [%s]\n", th_args.id, target);
         struct crypt_data data;
         data.initialized = 0;
         const char *current = th_info->mapped;
         const char *end = &th_info->mapped[th_info->length - 1];
         const char *line_end = NULL;
+        bool exit_found_flag = false;
+        char *exit_buffer = NULL;
         do
         {
             line_end = memchr(current, '\n', end - current + 1);
@@ -214,25 +210,55 @@ void *crack_worker(void *args)
             const char *hashed = crypt_r(buffer, th_info->salt, &data);
             if (strcmp(target_hashed, hashed) == 0)
             {
-                atomic_store_explicit(th_info->report_found, true, memory_order_relaxed);
-                // printf("%lu found password\n", th_info->tid);
                 if (th_info->stop_on_found)
+                {
+                    atomic_store_explicit(th_info->report_found, true, memory_order_relaxed);
                     pthread_exit(buffer);
+                }
+                if (!exit_found_flag)
+                {
+                    exit_buffer = malloc(line_length * sizeof *exit_buffer);
+                    if (exit_buffer == NULL)
+                    {
+                        fprintf(stderr, "malloc error\n");
+                        pthread_exit(CRACK_WORKER_ERR);
+                    }
+                    strcpy(exit_buffer, buffer);
+                    exit_found_flag = true;
+                }
             }
 
             atomic_fetch_add_explicit(th_info->progress, line_length, memory_order_relaxed);
             current = line_end + 1;
         } while (current <= end && !th_info->force_stop);
+
         free(buffer);
+        if (exit_found_flag)
+        {
+            atomic_store_explicit(th_info->report_found, true, memory_order_relaxed);
+            pthread_exit(exit_buffer);
+        }
         pthread_exit(NULL);
     pthread_cleanup_pop(0);
 }
 
 /// If 'CRACK_FOUND' was returned, memory allocated in '*ret_found' should be freed manually.\n
 /// If 'CRACK_NOT_FOUND' was returned, '*ret_found' is equal to NULL.\n
-/// Otherwise, '*ret_found' value is undefined.
-short crack(const char *salted_hash, const char *pswd_path, int n_threads, char **ret_found)
+/// Otherwise, '*ret_found' value is undefined. \n
+/// If 'NULL' is passed as 'ret_found', value is not set at all. \n
+/// If 'test' value is set to 'true' threads keep working even if password was found and only first
+/// 'test_bytes' bytes of a file are used for testing or less if a file is not long enough.\n
+/// To test entire file, function should be called with 'test = true' and 'test_bytes = -1'\n
+/// If 'test' value is set to 'false', 'test_bytes' value is ignored
+short crack(const char *salted_hash,
+            const char *pswd_path,
+            int n_threads,
+            char **ret_found,
+            bool test,
+            size_t test_bytes)
 {
+    if (n_threads <= 0)
+        return CRACK_ERR;
     const int fd = open(pswd_path, O_RDONLY);
     if (fd == -1)
     {
@@ -247,6 +273,8 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
         return CRACK_ERR;
     }
     size_t file_length = sb.st_size;
+    if (test && test_bytes < file_length)
+        file_length = test_bytes;
     if (file_length == 0)
         return CRACK_NOT_FOUND;
     char *mapped = mmap(NULL, file_length, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -308,7 +336,7 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
         th_info[created].force_stop = false;
         // args[created].main_tid = main_tid;
         // args[created].id = created;
-        th_info[created].stop_on_found = true;
+        th_info[created].stop_on_found = !test;
         if (pthread_create(&th_info[created].tid, NULL, crack_worker, &th_info[created]) != 0)
         {
             fprintf(stderr, "pthread_create error\n");
@@ -356,7 +384,7 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
         pthread_join(th_info[i].tid, (void**) &found_pswd);
         // printf("ret_found: [%s]", *ret_found);
         free_arg(&th_info[i]);
-        if (found_pswd != NULL)
+        if (found_pswd != NULL && ret_found != NULL)
             *ret_found = found_pswd;
         // printf("%lu finished with return: %s\n", threads[i], *ret_found);
         // printf("done: %lu, to_do: %lu\n", atomic_load_explicit(&progress, memory_order_relaxed), file_length);
@@ -365,12 +393,13 @@ short crack(const char *salted_hash, const char *pswd_path, int n_threads, char 
     munmap(mapped, file_length);
     free(th_info);
     print_progress(1, 1, bars, print_fps);
-    printf("\n");
+    // printf("\n");
     if (found)
         return CRACK_FOUND;
     else
     {
-        *ret_found = NULL;
+        if (ret_found != NULL)
+            *ret_found = NULL;
         return CRACK_NOT_FOUND;
     }
 }
@@ -382,16 +411,48 @@ int main(const int argc, char *argv[])
     int n_threads = -1;
     parse_argv(argc, argv, &salted_hash, &pswd_path, &n_threads);
     const int max_threads = (int) sysconf(_SC_NPROCESSORS_ONLN);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
     if (n_threads == -1)
     {
-        //todo: find best nr of threads
-        //print progress after every thread tested. print_progress(i, max_threads)
+        int best_thread = -1;
+        float best_time = -1.0f;
+        struct timespec test_start, test_end;
+        printf("Testing up to %d threads\n", max_threads);
+        for (int i = 1; i <= max_threads; i++)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &test_start);
+            printf("Thread %d:\n", i);
+            if (crack(salted_hash, pswd_path, i, NULL, true, 8192) == CRACK_ERR)
+                err(EXIT_FAILURE, "\ncrack_error\n");
+            clock_gettime(CLOCK_MONOTONIC, &test_end);
+            const float test_elapsed = (float) (test_end.tv_sec - test_start.tv_sec) +
+                                       (float) (test_end.tv_nsec - test_start.tv_nsec) / 1e9;
+            printf(" [%.3fs]", test_elapsed);
+            if (i == 1)
+            {
+                best_time = test_elapsed;
+                best_thread = i;
+                printf(" - new best");
+            }
+            if (test_elapsed < best_time)
+            {
+                best_time = test_elapsed;
+                best_thread = i;
+                printf(" - new best");
+            }
+            printf("\n");
+        }
+        printf("Best time for %d threads (%.3fs)\n", best_thread, best_time);
     }
     else
     {
         if (n_threads > max_threads) n_threads = max_threads;
         char *found_pass = NULL;
-        switch (crack(salted_hash, pswd_path, n_threads, &found_pass))
+        const short crack_result = crack(salted_hash, pswd_path, n_threads, &found_pass, false, 0);
+        printf("\n");
+        switch (crack_result)
         {
             case CRACK_FOUND:
                 printf("Found password: %s\n", found_pass);
@@ -409,5 +470,9 @@ int main(const int argc, char *argv[])
                 abort();
         }
     }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    const float elapsed = (float) (end.tv_sec - start.tv_sec) +
+                          (float) (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("\nFinished in %.2fs\n", elapsed);
     return 0;
 }
