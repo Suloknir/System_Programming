@@ -1,6 +1,6 @@
 // compilation:
 // gcc ./main.c -O3 -std=c17 -o main -lpthread -lcrypt
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdbool.h>
 #include <err.h>
@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <crypt.h>
+#include <stdalign.h>
 
 extern char *optarg;
 extern int opterr, optopt;
@@ -108,7 +109,10 @@ void free_arg(struct ThreadInfo *to_free)
 /// splits string of type '$alg$salt$hash'.\n
 /// ret_... values should be freed manually
 /// on success ret_alg = alg, ret_salt = salt, ret_hash = hash
-void desalinate(const char *salted_hash, char **ret_alg, char **ret_salt, char **ret_hash)
+void desalinate(const char *restrict salted_hash,
+                char **restrict ret_alg,
+                char **restrict ret_salt,
+                char **restrict ret_hash)
 {
     //todo: error checking
     const char *alg = salted_hash + 1;
@@ -122,7 +126,9 @@ void desalinate(const char *salted_hash, char **ret_alg, char **ret_salt, char *
 /// splits string of type '$alg$salt$hash'.\n
 /// ret_... values should be freed manually
 /// on success ret_salt = '$alg$salt', ret_hash = hash
-void desalinate2(const char *salted_hash, char **ret_salt, char **ret_hash)
+void desalinate2(const char *restrict salted_hash,
+                 char **restrict ret_salt,
+                 char **restrict ret_hash)
 {
     //todo: error checking
     const char *alg = salted_hash + 1;
@@ -196,6 +202,8 @@ void *crack_worker(void *args)
         const char *line_end = NULL;
         bool exit_found_flag = false;
         char *exit_buffer = NULL;
+        const size_t progress_min_update = 128;
+        size_t unreported_progress = 0;
         do
         {
             line_end = memchr(current, '\n', end - current + 1);
@@ -220,6 +228,7 @@ void *crack_worker(void *args)
             else
                 buffer[line_length] = '\0';
             const char *hashed = crypt_r(buffer, th_info->salt, &data);
+            // const char *hashed = "\0";
             if (strcmp(target_hashed, hashed) == 0)
             {
                 if (atomic_load_explicit(&th_info->stop_on_found, memory_order_relaxed))
@@ -239,8 +248,12 @@ void *crack_worker(void *args)
                     exit_found_flag = true;
                 }
             }
-
-            atomic_fetch_add_explicit(th_info->progress, line_length, memory_order_relaxed);
+            unreported_progress += line_length;
+            if (unreported_progress >= progress_min_update)
+            {
+                atomic_fetch_add_explicit(th_info->progress, unreported_progress, memory_order_relaxed);
+                unreported_progress = 0;
+            }
             current = line_end + 1;
         } while (current <= end && !atomic_load_explicit(&th_info->force_stop, memory_order_relaxed));
 
@@ -309,8 +322,8 @@ short crack(const char *salted_hash,
         return CRACK_ERR;
     }
 
-    _Atomic size_t progress = 0;
-    _Atomic bool found = false;
+    alignas(64) _Atomic size_t progress = 0;
+    alignas(64) _Atomic bool found = false;
     // const size_t main_tid = pthread_self();
     size_t next_start_id = 0;
     int created = 0;
