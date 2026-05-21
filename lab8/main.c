@@ -1,15 +1,16 @@
 // todo: sigint handler
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <err.h>
-#include <unistd.h>
-#include <stdbool.h>
-#include <mqueue.h>
-#include <time.h>
-#include <sys/mman.h>
 #include "ipc_datatypes.h"
+#include <err.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifndef CRACK_FOUND
 #define CRACK_FOUND 1
@@ -77,32 +78,100 @@ void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepat
 short crack(const char *salted_hash, const char *pswd_path, int n_jobs, char **ret_found)
 {
     const char *queue_name = "/hash_cracker_queue";
-    const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, NULL);
+    struct mq_attr attr = {0};
+    attr.mq_msgsize = sizeof(struct QueueMsg);
+    const int max_workers = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    attr.mq_maxmsg = (long) max_workers * 2;
+    const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, attr);
     if (queue_des == -1)
-        err(EXIT_FAILURE, "mq_open");
+    {
+        fprintf(stderr, "mq_open error\n");
+        return CRACK_ERR;
+    }
+
     const char *shm_name = "/hash_cracker_shm";
     const int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
     if (shm_fd == -1)
     {
+        mq_close(queue_des);
         mq_unlink(queue_name);
-        err(EXIT_FAILURE, "shm_open");
+        fprintf(stderr, "shmopen error\n");
+        return CRACK_ERR;
+    }
+    const size_t shm_size = sizeof(struct ShmData) + strlen(salted_hash);
+    if (ftruncate(shm_fd, (off_t) shm_size) == -1)
+    {
+        shm_unlink(shm_name);
+        mq_close(queue_des);
+        mq_unlink(queue_name);
+        fprintf(stderr, "ftruncate error\n");
+        return CRACK_ERR;
+    }
+    struct ShmData *shm_mapped = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_mapped == MAP_FAILED)
+    {
+        shm_unlink(shm_name);
+        mq_close(queue_des);
+        mq_unlink(queue_name);
+        fprintf(stderr, "mmap error\n");
+        return CRACK_ERR;
     }
     const int pswd_fd = open(pswd_path, O_RDONLY);
     if (pswd_fd == -1)
     {
+        munmap(shm_mapped, shm_size);
         shm_unlink(shm_name);
+        mq_close(queue_des);
         mq_unlink(queue_name);
-        err(EXIT_FAILURE, "open");
+        fprintf(stderr, "open error\n");
+        return CRACK_ERR;
     }
-    printf("queue name: %s", queue_name);
-    // const int max_processes = (int) sysconf(_SC_NPROCESSORS_ONLN);
+    printf("queue name: %s\n", queue_name);
+    char *workerArgv[4];
+    workerArgv[0] = "./worker";
+    workerArgv[1] = malloc(strlen(queue_name) + 1);
+    strcpy(workerArgv[1], queue_name);
+    const size_t buff_len = 16;
+    workerArgv[2] = malloc(buff_len);
+    snprintf(workerArgv[2], buff_len, "%d", n_jobs); // todo: change n_jobs, count jobs for a specific process
+    workerArgv[3] = NULL;
+    for (int i = 0; i < n_jobs; i++)
+    {
+        pid_t pid = fork();
+        if (pid == -1)
+        {
+            // for (int j = 0; j < i - 1; j++) todo: stop other processes
+            free(workerArgv[1]);
+            free(workerArgv[2]);
+            munmap(shm_mapped, shm_size);
+            close(pswd_fd);
+            shm_unlink(shm_name);
+            mq_close(queue_des);
+            fprintf(stderr, "fork error\n");
+            return CRACK_ERR;
+        }
+        else if (pid == 0)
+        {
+            execve("./worker", workerArgv, NULL);
+            err(EXIT_FAILURE, "execve error\n");
+        }
+        else
+        {
+            // parent
+        }
+    }
 
-
-    
+    sleep(3);
+    //todo: waitpid
+    free(workerArgv[1]);
+    free(workerArgv[2]);
+    munmap(shm_mapped, shm_size);
     close(pswd_fd);
     shm_unlink(shm_name);
     mq_close(queue_des);
     mq_unlink(queue_name);
+    if (ret_found != NULL)
+        *ret_found = NULL;
     return CRACK_NOT_FOUND;
 }
 
