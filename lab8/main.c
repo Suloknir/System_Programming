@@ -4,6 +4,9 @@
 #include <err.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <mqueue.h>
+#include <time.h>
+#include "definitions.h"
 
 void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepath, int *ret_n_jobs)
 {
@@ -57,5 +60,18 @@ int main(const int argc, char *argv[])
     char *pswd_path = NULL;
     int n_jobs = -1;
     parse_argv(argc, argv, &salted_hash, &pswd_path, &n_jobs);
-    
+    const char *queue_name = "/hash_21cracker_37q";
+    const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, NULL);
+    if (queue_des == -1)
+    err(EXIT_FAILURE, "mq_open");
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    printf("queue name: %s", queue_name);
+    mq_close(queue_des);
+    mq_unlink(queue_name);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+        const float elapsed = (float) (end.tv_sec - start.tv_sec) +
+                          (float) (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("\nFinished in %.2fs\n", elapsed);
+    return 0;
 }
