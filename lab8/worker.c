@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <mqueue.h>
-#include "definitions.h"
+#include "ipc_datatypes.h"
 
 int main(const int argc, char *argv[])
 {
