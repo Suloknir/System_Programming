@@ -143,7 +143,10 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
         fprintf(stderr, "mmap error\n");
         return CRACK_ERR;
     }
-    memset(shm_mapped, 0, shm_size);
+    shm_mapped->progress = 0;
+    shm_mapped->force_stop = false;
+    strcpy(shm_mapped->salted_hash, salted_hash);
+
     const int pswd_fd = open(pswd_path, O_RDONLY);
     if (pswd_fd == -1)
     {
@@ -178,7 +181,8 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
         }
         else if (workers[i] == 0)
         {
-            snprintf(workerArgv[2], buff_len, "%d", total_jobs + i); // todo: change to count n jobs for a specific process
+            snprintf(workerArgv[2], buff_len, "%d",
+                     total_jobs + i); // todo: change to count n jobs for a specific process
             execve("./worker", workerArgv, NULL);
             err(EXIT_FAILURE, "execve error\n");
         }
