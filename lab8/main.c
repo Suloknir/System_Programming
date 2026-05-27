@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,7 +50,7 @@ void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepat
             {
                 n = true;
                 char *endptr;
-                const int val = (int) strtol(optarg, &endptr, 0);
+                const int val = (int)strtol(optarg, &endptr, 0);
                 if (endptr == optarg || val < 1)
                     err(EXIT_FAILURE, "%s: option '%c' requires number >= 1 as an argument\n", argv[0], ret);
                 *ret_n_jobs = val;
@@ -75,14 +76,15 @@ void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepat
 /// '*ret_found' is equal to NULL.\n Otherwise, '*ret_found' value is
 /// undefined. If 'NULL' is passed as 'ret_found', value is not set
 /// at all.
-short crack(const char *salted_hash, const char *pswd_path, int n_jobs, char **ret_found)
+short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char **ret_found)
 {
     const char *queue_name = "/hash_cracker_queue";
     struct mq_attr attr = {0};
     attr.mq_msgsize = sizeof(struct QueueMsg);
-    const int max_workers = (int) sysconf(_SC_NPROCESSORS_ONLN);
-    attr.mq_maxmsg = (long) max_workers * 2;
-    const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, attr);
+    const int max_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    attr.mq_maxmsg = (long)max_workers * 2;
+    // const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, attr);
+    const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT, 0666, attr);
     if (queue_des == -1)
     {
         fprintf(stderr, "mq_open error\n");
@@ -90,7 +92,8 @@ short crack(const char *salted_hash, const char *pswd_path, int n_jobs, char **r
     }
 
     const char *shm_name = "/hash_cracker_shm";
-    const int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
+    // const int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
+    const int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT, 0666);
     if (shm_fd == -1)
     {
         mq_close(queue_des);
@@ -99,7 +102,7 @@ short crack(const char *salted_hash, const char *pswd_path, int n_jobs, char **r
         return CRACK_ERR;
     }
     const size_t shm_size = sizeof(struct ShmData) + strlen(salted_hash);
-    if (ftruncate(shm_fd, (off_t) shm_size) == -1)
+    if (ftruncate(shm_fd, (off_t)shm_size) == -1)
     {
         shm_unlink(shm_name);
         mq_close(queue_des);
@@ -133,36 +136,50 @@ short crack(const char *salted_hash, const char *pswd_path, int n_jobs, char **r
     strcpy(workerArgv[1], queue_name);
     const size_t buff_len = 16;
     workerArgv[2] = malloc(buff_len);
-    snprintf(workerArgv[2], buff_len, "%d", n_jobs); // todo: change n_jobs, count jobs for a specific process
     workerArgv[3] = NULL;
-    for (int i = 0; i < n_jobs; i++)
+    int created = 0;
+    const int to_create = max_workers > total_jobs ? total_jobs : max_workers;
+    pid_t workers[to_create];
+    for (int i = 0; i < to_create; i++)
     {
-        pid_t pid = fork();
-        if (pid == -1)
+        workers[i] = fork();
+        if (workers[i] == -1)
         {
-            // for (int j = 0; j < i - 1; j++) todo: stop other processes
+            for (int j = 0; j < created; j++)
+            {
+                kill(workers[j], SIGKILL);
+                waitpid(workers[j], NULL, 0);
+            }
             free(workerArgv[1]);
             free(workerArgv[2]);
             munmap(shm_mapped, shm_size);
             close(pswd_fd);
             shm_unlink(shm_name);
             mq_close(queue_des);
+            mq_unlink(queue_name);
             fprintf(stderr, "fork error\n");
             return CRACK_ERR;
         }
-        else if (pid == 0)
+        else if (workers[i] == 0)
         {
+            snprintf(workerArgv[2], buff_len, "%d", total_jobs); // todo: change to count n jobs for a specific process
             execve("./worker", workerArgv, NULL);
             err(EXIT_FAILURE, "execve error\n");
         }
         else
         {
+            created++;
             // parent
         }
     }
 
-    sleep(3);
-    //todo: waitpid
+    // sleep(3);
+    printf("killed\n");
+    for (int i = 0; i < created; i++)
+    {
+        kill(workers[i], SIGKILL);
+        waitpid(workers[i], NULL, 0);
+    }
     free(workerArgv[1]);
     free(workerArgv[2]);
     munmap(shm_mapped, shm_size);
@@ -179,14 +196,15 @@ int main(const int argc, char *argv[])
 {
     char *salted_hash = NULL;
     char *pswd_path = NULL;
-    int n_jobs = -1;
-    parse_argv(argc, argv, &salted_hash, &pswd_path, &n_jobs);
+    int total_jobs = -1;
+    parse_argv(argc, argv, &salted_hash, &pswd_path, &total_jobs);
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     char *found = NULL;
-    crack(salted_hash, pswd_path, n_jobs, &found);
+    crack(salted_hash, pswd_path, total_jobs, &found);
     clock_gettime(CLOCK_MONOTONIC, &end);
-    const double elapsed = (double) (end.tv_sec - start.tv_sec) + (double) (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("\nFinished in %.2fs\n", elapsed);
+    const double elapsed = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("\nFinished in %.2fs,\n", elapsed);
+    printf("Process group: %d, pid: %d\n", getpgrp(), getpid());
     return 0;
 }

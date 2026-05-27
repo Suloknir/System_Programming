@@ -1,18 +1,18 @@
 #ifndef _IPC_DATATYPES_H
 #define _IPC_DATATYPES_H 1
 #include <sys/types.h>
+#include <stdbool.h>
 
-#define FOUND 1
-#define NOT_FOUND 0
 struct FinishEvent
 {
     int worker_id;
-    short status;
+    char found_password[1];
 };
 
 struct ShmData
 {
     _Atomic size_t progress;
+    _Atomic bool force_stop;
     char salted_hash[1];
 };
 
