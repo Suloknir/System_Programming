@@ -3,11 +3,11 @@
 #include <sys/types.h>
 #include <stdbool.h>
 
-struct FinishEvent
-{
-    int worker_id;
-    char found_password[1];
-};
+// struct FoundEvent
+// {
+//     size_t pswd_len;
+//     char found_password[1];
+// };
 
 struct ShmData
 {
