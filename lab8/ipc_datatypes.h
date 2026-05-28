@@ -9,18 +9,23 @@
 //     char found_password[1];
 // };
 
-struct ShmData
+union PswdHash
+{
+    char salted_hash[1];
+    char found_password[1];
+};
+
+struct ShmFormat
 {
     _Atomic size_t progress;
     _Atomic bool force_stop;
-    char salted_hash[1];
+    union PswdHash data;
 };
 
 struct QueueMsg
 {
     off_t start;
     size_t length;
-    pid_t master_pid;
     int pswd_fd;
     int shm_fd;
 };
