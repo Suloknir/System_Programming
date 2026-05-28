@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "ipc_datatypes.h"
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mqueue.h>
 #include <signal.h>
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,31 +30,9 @@
 
 bool sigint_receaved = false;
 
-struct CleanerData
-{
-    char *workerArgv[4];
-    struct ShmFormat *shm_mapped;
-    struct sigaction *old_action;
-    const char *queue_name;
-    const char *shm_name;
-    size_t shm_size;
-    int pswd_fd;
-    int shm_fd;
-    mqd_t queue_fd;
+struct IpcsData ipd = {
+    .workerArgv = {"./worker", NULL, NULL, NULL}, //
 };
-
-struct CleanerData cleaner_data = {
-    {"./worker", NULL, NULL, NULL}, //
-    NULL, //
-    NULL, //
-    "/hash_cracker_queue", //
-    "/hash_cracker_shm", //
-    0, //
-    -1, //
-    -1, //
-    -1 //
-};
-
 void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepath, int *ret_n_jobs)
 {
     if (!ret_hash || !ret_filepath || !ret_n_jobs)
@@ -104,66 +84,82 @@ void sigint_handler(int signum) // NOLINT
     sigint_receaved = true;
 }
 
-void crack_cleaner(void)
+void clean(void)
 {
-    if (cleaner_data.workerArgv[1])
-        free(cleaner_data.workerArgv[1]);
-    if (cleaner_data.workerArgv[2])
-        free(cleaner_data.workerArgv[2]);
-    if (cleaner_data.shm_mapped)
-        munmap(cleaner_data.shm_mapped, cleaner_data.shm_size);
-    if (cleaner_data.shm_fd != -1)
-        shm_unlink(cleaner_data.shm_name);
-    if (cleaner_data.pswd_fd != -1)
-        close(cleaner_data.pswd_fd);
-    if (cleaner_data.queue_fd != -1)
+    if (ipd.workerArgv[1])
+        free(ipd.workerArgv[1]);
+    if (ipd.workerArgv[2])
+        free(ipd.workerArgv[2]);
+    if (ipd.shm_map != NULL && ipd.shm_map != MAP_FAILED)
+        munmap(ipd.shm_map, ipd.shm_size);
+    if (ipd.shm_fd > 0)
     {
-        mq_close(cleaner_data.queue_fd);
-        mq_unlink(cleaner_data.queue_name);
+        close(ipd.shm_fd);
+        shm_unlink(ipd.shm_name);
     }
-    sigaction(SIGINT, cleaner_data.old_action, NULL);
+    if (ipd.pswd_map == NULL && ipd.pswd_map != MAP_FAILED)
+        munmap(ipd.pswd_map, ipd.pswd_length);
+    if (ipd.pswd_fd > 0)
+        close(ipd.pswd_fd);
+    if (ipd.queue_fd > 0)
+    {
+        mq_close(ipd.queue_fd);
+        mq_unlink(ipd.queue_name);
+    }
+    sigaction(SIGINT, ipd.old_action, NULL);
 }
 
+struct timespec *set_timeout(long ms, struct timespec *ret_timeout)
+{
+    clock_gettime(CLOCK_REALTIME, ret_timeout);
+    ret_timeout->tv_sec += ms / 1000;
+    ret_timeout->tv_nsec += (ms % 1000) * 1000000;
+    if (ret_timeout->tv_nsec >= 1000000000)
+    {
+        ret_timeout->tv_sec += 1;
+        ret_timeout->tv_nsec -= 1000000000;
+    }
+    return ret_timeout;
+}
 /// returns -1 on failure and 0 on succes
-short open_ipcs(const char *salted_hash)
+short create_ipcs(const char *salted_hash)
 {
     struct mq_attr attr = {0};
     attr.mq_msgsize = sizeof(struct QueueMsg);
     attr.mq_maxmsg = 10;
     // cleaner_data.queue_fd = mq_open(cleaner_data.queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, &attr);
-    cleaner_data.queue_fd = mq_open(cleaner_data.queue_name, O_RDWR | O_CREAT, 0666, &attr);
-    if (cleaner_data.queue_fd == -1)
+    ipd.queue_fd = mq_open(ipd.queue_name, O_RDWR | O_CREAT, 0666, &attr);
+    if (ipd.queue_fd == -1)
     {
         fprintf(stderr, "mq_open error\n");
         return -1;
     }
 
     // const int shm_fd = shm_open(data.shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
-    cleaner_data.shm_fd = shm_open(cleaner_data.shm_name, O_RDWR | O_CREAT, 0666);
-    if (cleaner_data.shm_fd == -1)
+    ipd.shm_fd = shm_open(ipd.shm_name, O_RDWR | O_CREAT, 0666);
+    if (ipd.shm_fd == -1)
     {
-        crack_cleaner();
+        clean();
         fprintf(stderr, "shmopen error\n");
         return -1;
     }
-    cleaner_data.shm_size = sizeof(struct ShmFormat) + strlen(salted_hash);
-    if (ftruncate(cleaner_data.shm_fd, (off_t)cleaner_data.shm_size) == -1)
+    ipd.shm_size = sizeof(struct ShmFormat) + strlen(salted_hash);
+    if (ftruncate(ipd.shm_fd, (off_t)ipd.shm_size) == -1)
     {
-        crack_cleaner();
+        clean();
         fprintf(stderr, "ftruncate error\n");
         return -1;
     }
-    cleaner_data.shm_mapped =
-        mmap(NULL, cleaner_data.shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, cleaner_data.shm_fd, 0);
-    if (cleaner_data.shm_mapped == MAP_FAILED)
+    ipd.shm_map = mmap(NULL, ipd.shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, ipd.shm_fd, 0);
+    if (ipd.shm_map == MAP_FAILED)
     {
-        crack_cleaner();
-        fprintf(stderr, "mmap error\n");
+        clean();
+        fprintf(stderr, "mmap error (shm)\n");
         return -1;
     }
-    cleaner_data.shm_mapped->progress = 0;
-    cleaner_data.shm_mapped->force_stop = false;
-    strcpy(cleaner_data.shm_mapped->data.salted_hash, salted_hash);
+    ipd.shm_map->progress = 0;
+    ipd.shm_map->is_master_sending = true;
+    snprintf(ipd.shm_map->data.target_hash, NAME_MAX_LEN, "%s", salted_hash);
     return 0;
 }
 
@@ -178,74 +174,158 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sa.sa_handler = sigint_handler;
-    sigaction(SIGINT, &sa, cleaner_data.old_action);
+    sigaction(SIGINT, &sa, ipd.old_action);
 
     const int max_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (open_ipcs(salted_hash) != 0)
+    if (create_ipcs(salted_hash) != 0)
         return CRACK_ERR;
-    cleaner_data.pswd_fd = open(pswd_path, O_RDONLY);
-    if (cleaner_data.pswd_fd == -1)
+    ipd.pswd_fd = open(pswd_path, O_RDONLY);
+    if (ipd.pswd_fd == -1)
     {
-        crack_cleaner();
+        clean();
         fprintf(stderr, "open error\n");
         return CRACK_ERR;
     }
-    printf("queue name: %s\n", cleaner_data.queue_name);
+    struct stat sb;
+    if (fstat(ipd.pswd_fd, &sb) == -1)
+    {
+        clean();
+        fprintf(stderr, "fstat error\n");
+        return CRACK_ERR;
+    }
+    ipd.pswd_length = sb.st_size;
+    if (ipd.pswd_length == 0)
+        return CRACK_NOT_FOUND;
+    ipd.pswd_map = mmap(NULL, ipd.pswd_length, PROT_READ, MAP_PRIVATE, ipd.pswd_fd, 0);
+    if (ipd.pswd_map == MAP_FAILED)
+    {
+        clean();
+        fprintf(stderr, "mmap error (pswd)\n");
+        return CRACK_ERR;
+    }
+
+    printf("queue name: %s\n", ipd.queue_name);
 
     // cleaner_data.workerArgv[0] = "./worker";
-    cleaner_data.workerArgv[1] = malloc(strlen(cleaner_data.queue_name) + 1);
-    strcpy(cleaner_data.workerArgv[1], cleaner_data.queue_name);
+    ipd.workerArgv[1] = malloc(strlen(ipd.queue_name) + 1);
+    snprintf(ipd.workerArgv[1], NAME_MAX_LEN, "%s", ipd.queue_name);
     const size_t buff_len = 16;
-    cleaner_data.workerArgv[2] = malloc(buff_len);
-    snprintf(cleaner_data.workerArgv[2], buff_len, "%d", getpid());
+    ipd.workerArgv[2] = malloc(buff_len);
+    snprintf(ipd.workerArgv[2], buff_len, "%d", getpid());
 
-    int created = 0;
-    const int to_create = max_workers > total_jobs ? total_jobs : max_workers;
-    pid_t workers[to_create];
-    for (int i = 0; i < to_create; i++)
+    int processes_created = 0;
+    const int workers_to_create = max_workers > total_jobs ? total_jobs : max_workers;
+    pid_t workers[workers_to_create];
+    for (int i = 0; i < workers_to_create; i++)
     {
         workers[i] = fork();
         if (workers[i] == -1)
         {
-            for (int j = 0; j < created; j++)
+            for (int j = 0; j < processes_created; j++)
             {
                 kill(workers[j], SIGTERM);
                 waitpid(workers[j], NULL, 0);
             }
-            crack_cleaner();
+            clean();
             fprintf(stderr, "fork error\n");
             return CRACK_ERR;
         }
         else if (workers[i] == 0)
         {
-            execve("./worker", cleaner_data.workerArgv, NULL);
+            execve("./worker", ipd.workerArgv, NULL);
             err(EXIT_FAILURE, "execve error\n");
         }
         else
         {
-            created++;
+            processes_created++;
         }
     }
-    struct QueueMsg msg;
-    msg.start = 888;
-    msg.length = 777;
-    msg.pswd_fd = cleaner_data.pswd_fd;
-    msg.shm_fd = cleaner_data.shm_fd;
-    mq_send(cleaner_data.queue_fd, (char *)&msg, sizeof(msg), 1);
+    const char *mapped = ipd.pswd_map;
+    const size_t file_length = ipd.pswd_length;
+    struct QueueMsg msg = {0};
+    msg.pswd_fd = ipd.pswd_fd;
+    msg.shm_size = ipd.shm_size;
+    // msg.shm_name = ipd.shm_name;
+    snprintf(msg.shm_name, NAME_MAX_LEN, "%s", ipd.shm_name);
 
-    for (int i = 0; i < created; i++)
+    size_t approx_job_size = file_length / total_jobs;
+    if (approx_job_size == 0)
+        approx_job_size = 1;
+    size_t next_start_offset = 0;
+    int jobs_sent = 0;
+    for (int i = 0; i < total_jobs; i++)
     {
-        waitpid(workers[i], NULL, 0);
-        printf("%d finished\n", workers[i]);
+        const size_t job_start_offset = next_start_offset;
+        if (job_start_offset >= file_length)
+            break;
+        size_t job_end_offset;
+        if (i == total_jobs - 1)
+            job_end_offset = file_length - 1;
+        else
+        {
+            job_end_offset = (i + 1) * approx_job_size - 1;
+            if (job_end_offset < job_start_offset)
+                continue;
+            if (job_end_offset < file_length - 1 && mapped[job_end_offset] != '\n')
+            {
+                const char *line_end = memchr(&mapped[job_end_offset], '\n', file_length - job_end_offset);
+                if (line_end != NULL)
+                    job_end_offset = line_end - mapped;
+                else
+                {
+                    job_end_offset = file_length - 1;
+                    i = total_jobs - 1; // to stop after just that job
+                }
+            }
+        }
+        next_start_offset = job_end_offset + 1;
+        struct timespec timeout;
+        msg.start = (off_t)job_start_offset;
+        msg.job_id = jobs_sent;
+        msg.length = job_end_offset - job_start_offset + 1;
+        while (!sigint_receaved)
+        {
+            const ssize_t bytes_sent =
+                mq_timedsend(ipd.queue_fd, (const char *)&msg, sizeof(msg), 1, set_timeout(10, &timeout));
+            if (bytes_sent == -1)
+            {
+                if (errno == ETIMEDOUT)
+                {
+                    // printf("send timeout (probably queue is full)\n"); // fixme: remove in final code
+                    continue;
+                }
+                else
+                {
+                    clean();
+                    fprintf(stderr, "mq_timedsend error\n");
+                    return CRACK_ERR;
+                }
+            }
+            jobs_sent++;
+            break;
+        }
     }
-    crack_cleaner();
+    ipd.shm_map->is_master_sending = false;
+    //if(sigint_receaved) //todo
+    munmap(ipd.pswd_map, ipd.pswd_length);
+    ipd.pswd_map = NULL;
+
+    for (int i = 0; i < processes_created; i++)
+        waitpid(workers[i], NULL, 0);
+    printf("[MASTER] sent %d jobs\n", jobs_sent);
+    printf("[MASTER] created %d processes\n", processes_created);
+    clean();
+    if(sigint_receaved)
+        return CRACK_ERR;
     if (ret_found != NULL)
-        *ret_found = NULL;
+    *ret_found = NULL;
     return CRACK_NOT_FOUND;
 }
 
 int main(const int argc, char *argv[])
 {
+    snprintf(ipd.queue_name, NAME_MAX_LEN, "%s", "/hash_cracker_queue");
+    snprintf(ipd.shm_name, NAME_MAX_LEN, "%s", "/hash_cracker_shm");
     char *salted_hash = NULL;
     char *pswd_path = NULL;
     int total_jobs = -1;
