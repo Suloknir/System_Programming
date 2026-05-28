@@ -28,6 +28,8 @@
 #define CRACK_ERR -1
 #endif
 
+bool sigint_receaved = false;
+
 struct CleanerData
 {
     char *workerArgv[4];
@@ -101,8 +103,7 @@ void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepat
 
 void sigint_handler(int signum) // NOLINT
 {
-    // exit(EXIT_FAILURE);
-    // printf("got signal %d\n", signum);
+    sigint_receaved = true;
 }
 
 void crack_cleaner(void)
@@ -177,7 +178,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
 {
     struct sigaction sa = {0};
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = 0;
     sa.sa_handler = sigint_handler;
     sigaction(SIGINT, &sa, cleaner_data.old_action);
 
@@ -227,6 +228,8 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
             created++;
         }
     }
+
+
 
     for (int i = 0; i < created; i++)
     {
