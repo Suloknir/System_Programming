@@ -20,7 +20,7 @@ struct QueueMsg
 {
     off_t start;
     size_t length;
-    int pipe_fd;
+    pid_t master_pid;
     int pswd_fd;
     int shm_fd;
 };

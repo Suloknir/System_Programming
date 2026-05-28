@@ -1,12 +1,12 @@
 // todo: sigint handler
 // todo: worker notifies master by sending signal to pid = getpgrp() (master pid)
 // todo: sigrtmin + 1 handler in master if worker found password
-
 #define _GNU_SOURCE
 #include "ipc_datatypes.h"
 #include <err.h>
 #include <fcntl.h>
 #include <mqueue.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +27,31 @@
 #ifndef CRACK_ERR
 #define CRACK_ERR -1
 #endif
+
+struct CleanerData
+{
+    char *workerArgv[4];
+    struct ShmData *shm_mapped;
+    struct sigaction *old_action;
+    const char *queue_name;
+    const char *shm_name;
+    size_t shm_size;
+    int pswd_fd;
+    int shm_fd;
+    int queue_des;
+};
+
+struct CleanerData cleaner_data = {
+    {"./worker", NULL, NULL, NULL}, //
+    NULL, //
+    NULL, //
+    "/hash_cracker_queue", //
+    "/hash_cracker_shm", //
+    0, //
+    -1, //
+    -1, //
+    -1 //
+};
 
 void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepath, int *ret_n_jobs)
 {
@@ -74,30 +99,73 @@ void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepat
     }
 }
 
-void crack_cleaner(char **workerArgv, //
-                   struct ShmData *shm_mapped, //
-                   size_t shm_size, //
-                   int pswd_fd, //
-                   const char *shm_name, //
-                   int queue_des, //
-                   const char *queue_name)
+void sigint_handler(int signum) // NOLINT
 {
-    if (workerArgv)
+    // exit(EXIT_FAILURE);
+    // printf("got signal %d\n", signum);
+}
+
+void crack_cleaner(void)
+{
+    if (cleaner_data.workerArgv[1])
+        free(cleaner_data.workerArgv[1]);
+    if (cleaner_data.workerArgv[2])
+        free(cleaner_data.workerArgv[2]);
+    if (cleaner_data.shm_mapped)
+        munmap(cleaner_data.shm_mapped, cleaner_data.shm_size);
+    if (cleaner_data.shm_fd != -1)
+        shm_unlink(cleaner_data.shm_name);
+    if (cleaner_data.pswd_fd != -1)
+        close(cleaner_data.pswd_fd);
+    if (cleaner_data.queue_des != -1)
     {
-        free(workerArgv[1]);
-        free(workerArgv[2]);
+        mq_close(cleaner_data.queue_des);
+        mq_unlink(cleaner_data.queue_name);
     }
-    if (shm_mapped)
-        munmap(shm_mapped, shm_size);
-    if (shm_name)
-        shm_unlink(shm_name);
-    if (pswd_fd != -1)
-        close(pswd_fd);
-    if (queue_des)
+    sigaction(SIGINT, cleaner_data.old_action, NULL);
+}
+
+/// returns -1 on failure and 0 on succes
+short init_ipc(const char *salted_hash, long queue_max_msg)
+{
+    struct mq_attr attr = {0};
+    attr.mq_msgsize = sizeof(struct QueueMsg);
+    attr.mq_maxmsg = queue_max_msg;
+    // const mqd_t queue_des = mq_open(data.queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, attr);
+    cleaner_data.queue_des = mq_open(cleaner_data.queue_name, O_RDWR | O_CREAT, 0666, attr);
+    if (cleaner_data.queue_des == -1)
     {
-        mq_close(queue_des);
-        mq_unlink(queue_name);
+        fprintf(stderr, "mq_open error\n");
+        return -1;
     }
+
+    // const int shm_fd = shm_open(data.shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
+    cleaner_data.shm_fd = shm_open(cleaner_data.shm_name, O_RDWR | O_CREAT, 0666);
+    if (cleaner_data.shm_fd == -1)
+    {
+        crack_cleaner();
+        fprintf(stderr, "shmopen error\n");
+        return -1;
+    }
+    cleaner_data.shm_size = sizeof(struct ShmData) + strlen(salted_hash);
+    if (ftruncate(cleaner_data.shm_fd, (off_t)cleaner_data.shm_size) == -1)
+    {
+        crack_cleaner();
+        fprintf(stderr, "ftruncate error\n");
+        return -1;
+    }
+    cleaner_data.shm_mapped =
+        mmap(NULL, cleaner_data.shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, cleaner_data.shm_fd, 0);
+    if (cleaner_data.shm_mapped == MAP_FAILED)
+    {
+        crack_cleaner();
+        fprintf(stderr, "mmap error\n");
+        return -1;
+    }
+    cleaner_data.shm_mapped->progress = 0;
+    cleaner_data.shm_mapped->force_stop = false;
+    strcpy(cleaner_data.shm_mapped->salted_hash, salted_hash);
+    return 0;
 }
 
 /// If 'CRACK_FOUND' was returned, memory allocated in '*ret_found'
@@ -107,61 +175,29 @@ void crack_cleaner(char **workerArgv, //
 /// at all.
 short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char **ret_found)
 {
-    const char *queue_name = "/hash_cracker_queue";
-    struct mq_attr attr = {0};
-    attr.mq_msgsize = sizeof(struct QueueMsg);
+    struct sigaction sa = {0};
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_handler = sigint_handler;
+    sigaction(SIGINT, &sa, cleaner_data.old_action);
+
     const int max_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    attr.mq_maxmsg = (long)max_workers * 2;
-    const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, attr);
-    // const mqd_t queue_des = mq_open(queue_name, O_RDWR | O_CREAT, 0666, attr);
-    if (queue_des == -1)
-    {
-        fprintf(stderr, "mq_open error\n");
+    if (init_ipc(salted_hash, (long)max_workers * 2) != 0)
         return CRACK_ERR;
-    }
-
-    const char *shm_name = "/hash_cracker_shm";
-    const int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
-    // const int shm_fd = shm_open(shm_name, O_RDWR | O_CREAT, 0666);
-    if (shm_fd == -1)
+    cleaner_data.pswd_fd = open(pswd_path, O_RDONLY);
+    if (cleaner_data.pswd_fd == -1)
     {
-        crack_cleaner(NULL, NULL, -1, -1, NULL, queue_des, queue_name);
-        fprintf(stderr, "shmopen error\n");
-        return CRACK_ERR;
-    }
-    const size_t shm_size = sizeof(struct ShmData) + strlen(salted_hash);
-    if (ftruncate(shm_fd, (off_t)shm_size) == -1)
-    {
-        crack_cleaner(NULL, NULL, -1, -1, shm_name, queue_des, queue_name);
-        fprintf(stderr, "ftruncate error\n");
-        return CRACK_ERR;
-    }
-    struct ShmData *shm_mapped = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (shm_mapped == MAP_FAILED)
-    {
-        crack_cleaner(NULL, NULL, -1, -1, shm_name, queue_des, queue_name);
-        fprintf(stderr, "mmap error\n");
-        return CRACK_ERR;
-    }
-    shm_mapped->progress = 0;
-    shm_mapped->force_stop = false;
-    strcpy(shm_mapped->salted_hash, salted_hash);
-
-    const int pswd_fd = open(pswd_path, O_RDONLY);
-    if (pswd_fd == -1)
-    {
-        crack_cleaner(NULL, shm_mapped, shm_size, -1, shm_name, queue_des, queue_name);
+        crack_cleaner();
         fprintf(stderr, "open error\n");
         return CRACK_ERR;
     }
-    printf("queue name: %s\n", queue_name);
-    char *workerArgv[4];
-    workerArgv[0] = "./worker";
-    workerArgv[1] = malloc(strlen(queue_name) + 1);
-    strcpy(workerArgv[1], queue_name);
+    printf("queue name: %s\n", cleaner_data.queue_name);
+
+    // cleaner_data.workerArgv[0] = "./worker";
+    cleaner_data.workerArgv[1] = malloc(strlen(cleaner_data.queue_name) + 1);
+    strcpy(cleaner_data.workerArgv[1], cleaner_data.queue_name);
     const size_t buff_len = 16;
-    workerArgv[2] = malloc(buff_len);
-    workerArgv[3] = NULL;
+    cleaner_data.workerArgv[2] = malloc(buff_len);
     int created = 0;
     const int to_create = max_workers > total_jobs ? total_jobs : max_workers;
     pid_t workers[to_create];
@@ -175,15 +211,15 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
                 kill(workers[j], SIGKILL);
                 waitpid(workers[j], NULL, 0);
             }
-            crack_cleaner(workerArgv, shm_mapped, shm_size, pswd_fd, shm_name, queue_des, queue_name);
+            crack_cleaner();
             fprintf(stderr, "fork error\n");
             return CRACK_ERR;
         }
         else if (workers[i] == 0)
         {
-            snprintf(workerArgv[2], buff_len, "%d",
-                     total_jobs + i); // todo: change to count n jobs for a specific process
-            execve("./worker", workerArgv, NULL);
+            snprintf(cleaner_data.workerArgv[2], buff_len, "%d",
+                     total_jobs); // todo: change to count n jobs for a specific process
+            execve("./worker", cleaner_data.workerArgv, NULL);
             err(EXIT_FAILURE, "execve error\n");
         }
         else
@@ -192,13 +228,12 @@ short crack(const char *salted_hash, const char *pswd_path, int total_jobs, char
         }
     }
 
-    // sleep(3);
-    // printf("killed\n");
     for (int i = 0; i < created; i++)
     {
         waitpid(workers[i], NULL, 0);
+        printf("%d finished\n", workers[i]);
     }
-    crack_cleaner(workerArgv, shm_mapped, shm_size, pswd_fd, shm_name, queue_des, queue_name);
+    crack_cleaner();
     if (ret_found != NULL)
         *ret_found = NULL;
     return CRACK_NOT_FOUND;
@@ -213,7 +248,7 @@ int main(const int argc, char *argv[])
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     char *found = NULL;
-    crack(salted_hash, pswd_path, total_jobs, &found);
+    crack(salted_hash, pswd_path, total_jobs, &found); // todo: switch statement
     clock_gettime(CLOCK_MONOTONIC, &end);
     const double elapsed = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
     printf("\nFinished in %.2fs,\n", elapsed);
