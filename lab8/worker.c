@@ -57,6 +57,11 @@ struct timespec *set_timeout(long ms, struct timespec *ret_timeout)
     return ret_timeout;
 }
 
+void process_task(struct QueueMsg task)
+{
+
+}
+
 void crack(const char *queue_name)
 {
     ipd.queue_fd = mq_open(queue_name, O_RDONLY);
@@ -75,7 +80,7 @@ void crack(const char *queue_name)
         clean();
         exit(EXIT_FAILURE);
     }
-    printf("worker: received first job_id = %d\n", msg.job_id);
+    printf("worker: received first task_id = %d\n", msg.task_id);
     ipd.pswd_fd = msg.pswd_fd;
     struct stat sb;
     if (fstat(ipd.pswd_fd, &sb) == -1)
@@ -104,7 +109,7 @@ void crack(const char *queue_name)
         clean();
         err(EXIT_FAILURE, "mmap error (shm)\n");
     }
-    // todo: also process first job!!!
+    // todo: also process first task!!!
     for(int i = 0; i < 10000000; i++){} //work simulation
     do
     {
@@ -122,7 +127,7 @@ void crack(const char *queue_name)
                 err(EXIT_FAILURE, "mq_timedreceive error\n");
             }
         }
-        // printf("[WORKER]  received job_id = %d\n", msg.job_id);
+        // printf("[WORKER]  received task_id = %d\n", msg.task_id);
     } while (bytes_received > 0 || atomic_load_explicit(&ipd.shm_map->is_master_sending, memory_order_relaxed));
 }
 

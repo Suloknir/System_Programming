@@ -20,10 +20,10 @@ struct ShmFormat
 
 struct QueueMsg
 {
-    off_t start;
+    off_t start_offset;
     size_t length;
     size_t shm_size;
-    int job_id;
+    int task_id;
     int pswd_fd;
     char shm_name[NAME_MAX_LEN];
 };
