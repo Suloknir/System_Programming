@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <mqueue.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,9 +32,10 @@
 
 bool sigint_receaved = false;
 
-struct IpcsData ipd = {
-    .workerArgv = {"./worker", NULL, NULL, NULL}, //
-};
+struct IpcsData ipd = {0};
+// struct IpcsData ipd = {
+//     .workerArgv = {"./worker", NULL, NULL, NULL}, //
+// };
 
 void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepath, int *ret_n_tasks)
 {
@@ -86,28 +88,22 @@ void sigint_handler(int signum) // NOLINT
     sigint_receaved = true;
 }
 
-void clean(void)
+void clean_ipc(void)
 {
-    if (ipd.workerArgv[1])
-        free(ipd.workerArgv[1]);
-    if (ipd.workerArgv[2])
-        free(ipd.workerArgv[2]);
     if (ipd.shm_map != NULL && ipd.shm_map != MAP_FAILED)
-        munmap(ipd.shm_map, ipd.shm_size);
-    if (ipd.shm_fd > 0)
     {
-        close(ipd.shm_fd);
-        shm_unlink(ipd.shm_name);
+        atomic_store_explicit(&ipd.shm_map->is_master_sending, false, memory_order_relaxed);
+        atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed); // to stop workers
+        munmap(ipd.shm_map, ipd.shm_size);
     }
+    if (ipd.shm_fd > 0)
+        close(ipd.shm_fd);
     if (ipd.pswd_map == NULL && ipd.pswd_map != MAP_FAILED)
         munmap(ipd.pswd_map, ipd.pswd_length);
     if (ipd.pswd_fd > 0)
         close(ipd.pswd_fd);
     if (ipd.queue_fd > 0)
-    {
         mq_close(ipd.queue_fd);
-        mq_unlink(ipd.queue_name);
-    }
     sigaction(SIGINT, ipd.old_action, NULL);
 }
 
@@ -123,45 +119,72 @@ struct timespec *set_timeout(long ms, struct timespec *ret_timeout)
     }
     return ret_timeout;
 }
+
+/// returns -1 on failure and 0 on succes
+short remove_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1)
+    {
+        fprintf(stderr, "fcntl getfd error");
+        return -1;
+    }
+    flags &= ~FD_CLOEXEC;
+    if (fcntl(fd, F_SETFD, flags) == -1)
+    {
+        fprintf(stderr, "fcntl setfd error");
+        return -1;
+    }
+    return 0;
+}
+
 /// returns -1 on failure and 0 on succes
 short create_ipcs(const char *salted_hash)
 {
+    char queue_name[] = "/hash_cracker_queue";
+    char shm_name[] = "/hash_cracker_shm";
     struct mq_attr attr = {0};
     attr.mq_msgsize = sizeof(struct QueueMsg);
     attr.mq_maxmsg = 10;
     // cleaner_data.queue_fd = mq_open(cleaner_data.queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, &attr);
-    ipd.queue_fd = mq_open(ipd.queue_name, O_RDWR | O_CREAT, 0666, &attr);
+    ipd.queue_fd = mq_open(queue_name, O_RDWR | O_CREAT, 0666, &attr);
     if (ipd.queue_fd == -1)
     {
         fprintf(stderr, "mq_open error\n");
         return -1;
     }
-
+    mq_unlink(queue_name);
+    remove_cloexec(ipd.queue_fd);
     // const int shm_fd = shm_open(data.shm_name, O_RDWR | O_CREAT | O_EXCL, 0666);
-    ipd.shm_fd = shm_open(ipd.shm_name, O_RDWR | O_CREAT, 0666);
+    ipd.shm_fd = shm_open(shm_name, O_RDWR | O_CREAT, 0666);
     if (ipd.shm_fd == -1)
     {
-        clean();
+        clean_ipc();
         fprintf(stderr, "shmopen error\n");
         return -1;
     }
+    shm_unlink(shm_name);
+    remove_cloexec(ipd.shm_fd);
     ipd.shm_size = sizeof(struct ShmFormat) + strlen(salted_hash);
     if (ftruncate(ipd.shm_fd, (off_t)ipd.shm_size) == -1)
     {
-        clean();
+        clean_ipc();
         fprintf(stderr, "ftruncate error\n");
         return -1;
     }
     ipd.shm_map = mmap(NULL, ipd.shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, ipd.shm_fd, 0);
     if (ipd.shm_map == MAP_FAILED)
     {
-        clean();
+        clean_ipc();
         fprintf(stderr, "mmap error (shm)\n");
         return -1;
     }
-    ipd.shm_map->progress = 0;
-    ipd.shm_map->is_master_sending = true;
-    snprintf(ipd.shm_map->data.target_hash, NAME_MAX_LEN, "%s", salted_hash);
+    atomic_store_explicit(&ipd.shm_map->progress, 0, memory_order_relaxed);
+    atomic_store_explicit(&ipd.shm_map->is_password_found, false, memory_order_relaxed);
+    atomic_store_explicit(&ipd.shm_map->is_master_sending, true, memory_order_relaxed);
+    snprintf(ipd.shm_map->target_hash, SHM_STRING_SIZE, "%s", salted_hash);
+
+    printf("queue name: %s\n", queue_name);
     return 0;
 }
 
@@ -184,14 +207,15 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     ipd.pswd_fd = open(pswd_path, O_RDONLY);
     if (ipd.pswd_fd == -1)
     {
-        clean();
+        clean_ipc();
         fprintf(stderr, "open error\n");
         return CRACK_ERR;
     }
+    remove_cloexec(ipd.pswd_fd);
     struct stat sb;
     if (fstat(ipd.pswd_fd, &sb) == -1)
     {
-        clean();
+        clean_ipc();
         fprintf(stderr, "fstat error\n");
         return CRACK_ERR;
     }
@@ -201,25 +225,29 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     ipd.pswd_map = mmap(NULL, ipd.pswd_length, PROT_READ, MAP_PRIVATE, ipd.pswd_fd, 0);
     if (ipd.pswd_map == MAP_FAILED)
     {
-        clean();
+        clean_ipc();
         fprintf(stderr, "mmap error (pswd)\n");
         return CRACK_ERR;
     }
-
-    printf("queue name: %s\n", ipd.queue_name);
-
-    // cleaner_data.workerArgv[0] = "./worker";
-    ipd.workerArgv[1] = malloc(strlen(ipd.queue_name) + 1);
-    snprintf(ipd.workerArgv[1], NAME_MAX_LEN, "%s", ipd.queue_name);
-    const size_t buff_len = 16;
-    ipd.workerArgv[2] = malloc(buff_len);
-    snprintf(ipd.workerArgv[2], buff_len, "%d", getpid());
+    const size_t av_len = 16;
+    char arg[3][av_len];
+    snprintf(arg[0], av_len, "./worker");
+    snprintf(arg[1], av_len, "%d", ipd.queue_fd);
+    snprintf(arg[2], av_len, "%d", getpid());
+    char *workerArgv[] = {
+        arg[0],
+        arg[1],
+        arg[2],
+        NULL,
+    };
 
     int processes_created = 0;
     const int workers_to_create = max_workers > total_tasks ? total_tasks : max_workers;
     pid_t workers[workers_to_create];
     for (int i = 0; i < workers_to_create; i++)
     {
+        if (sigint_receaved)
+            break;
         workers[i] = fork();
         if (workers[i] == -1)
         {
@@ -228,13 +256,13 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
                 kill(workers[j], SIGTERM);
                 waitpid(workers[j], NULL, 0);
             }
-            clean();
+            clean_ipc();
             fprintf(stderr, "fork error\n");
             return CRACK_ERR;
         }
         else if (workers[i] == 0)
         {
-            execve("./worker", ipd.workerArgv, NULL);
+            execve("./worker", workerArgv, NULL);
             err(EXIT_FAILURE, "execve error\n");
         }
         else
@@ -247,8 +275,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     struct QueueMsg msg = {0};
     msg.pswd_fd = ipd.pswd_fd;
     msg.shm_size = ipd.shm_size;
-    // msg.shm_name = ipd.shm_name;
-    snprintf(msg.shm_name, NAME_MAX_LEN, "%s", ipd.shm_name);
+    msg.shm_fd = ipd.shm_fd;
 
     size_t approx_task_size = file_length / total_tasks;
     if (approx_task_size == 0)
@@ -257,6 +284,8 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     int tasks_sent = 0;
     for (int i = 0; i < total_tasks; i++)
     {
+        if (sigint_receaved)
+            break;
         const size_t task_start_offset = next_start_offset;
         if (task_start_offset >= file_length)
             break;
@@ -285,7 +314,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         msg.start_offset = (off_t)task_start_offset;
         msg.task_id = tasks_sent;
         msg.length = task_end_offset - task_start_offset + 1;
-        while (!sigint_receaved)
+        while (!sigint_receaved && !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
         {
             const ssize_t bytes_sent =
                 mq_timedsend(ipd.queue_fd, (const char *)&msg, sizeof(msg), 1, set_timeout(10, &timeout));
@@ -296,9 +325,13 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
                     // printf("send timeout (probably queue is full)\n"); // fixme: remove in final code
                     continue;
                 }
+                else if (sigint_receaved)
+                {
+                    break;
+                }
                 else
                 {
-                    clean();
+                    clean_ipc();
                     fprintf(stderr, "mq_timedsend error\n");
                     return CRACK_ERR;
                 }
@@ -307,38 +340,67 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
             break;
         }
     }
-    ipd.shm_map->is_master_sending = false;
-    // if(sigint_receaved) //todo
+    atomic_store_explicit(&ipd.shm_map->is_master_sending, false, memory_order_relaxed);
     munmap(ipd.pswd_map, ipd.pswd_length);
     ipd.pswd_map = NULL;
-
     for (int i = 0; i < processes_created; i++)
         waitpid(workers[i], NULL, 0);
-    printf("[MASTER] sent %d tasks\n", tasks_sent);
-    printf("[MASTER] created %d processes\n", processes_created);
-    clean();
+    printf("sent %d tasks\n", tasks_sent);
+    // printf("[MASTER] progress = %lu\n", atomic_load(&ipd.shm_map->progress));
+    // printf("[MASTER] file_length = %lu\n", file_length);
+    printf("spawned %d workers\n", processes_created);
     if (sigint_receaved)
-        return CRACK_ERR;
-    if (ret_found != NULL)
-        *ret_found = NULL;
-    return CRACK_NOT_FOUND;
+        printf("INTERRUPTED BY SIGNAL [SIGINT]\n");
+    const bool found = atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed);
+    if (found)
+    {
+        if (ret_found != NULL)
+            *ret_found = strdup(ipd.shm_map->found_password);
+    }
+    else
+    {
+        if (ret_found != NULL)
+            *ret_found = NULL;
+    }
+    clean_ipc();
+    if (found)
+        return CRACK_FOUND;
+    else
+        return CRACK_NOT_FOUND;
 }
 
 int main(const int argc, char *argv[])
 {
-    snprintf(ipd.queue_name, NAME_MAX_LEN, "%s", "/hash_cracker_queue");
-    snprintf(ipd.shm_name, NAME_MAX_LEN, "%s", "/hash_cracker_shm");
     char *salted_hash = NULL;
     char *pswd_path = NULL;
     int total_tasks = -1;
     parse_argv(argc, argv, &salted_hash, &pswd_path, &total_tasks);
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    char *found = NULL;
-    crack(salted_hash, pswd_path, total_tasks, &found); // todo: switch statement
+    // crack(salted_hash, pswd_path, total_tasks, &found); // todo: switch statement
+    char *found_pass = NULL;
+    const short crack_result = crack(salted_hash, pswd_path, total_tasks, &found_pass);
+    printf("\n");
+    switch (crack_result)
+    {
+        case CRACK_FOUND:
+            printf("Found password: %s\n", found_pass);
+            free(found_pass);
+            break;
+        case CRACK_NOT_FOUND:
+            printf("Password not found\n");
+            break;
+        case CRACK_ERR:
+            err(EXIT_FAILURE, "crack_error\n");
+            // ReSharper disable once CppDFAUnreachableCode
+            break;
+        default:
+            fprintf(stderr, "Unexpected crack return\n");
+            abort();
+    }
     clock_gettime(CLOCK_MONOTONIC, &end);
     const double elapsed = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
     printf("\nFinished in %.2fs,\n", elapsed);
-    printf("Pid: %d\n", getpid());
+    // printf("Pid: %d\n", getpid());
     return 0;
 }

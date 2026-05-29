@@ -3,19 +3,15 @@
 #include <sys/types.h>
 #include <stdbool.h>
 
-#define NAME_MAX_LEN 64
-
-union PswdHash
-{
-    char target_hash[1];
-    char found_password[1];
-};
+#define SHM_STRING_SIZE 256
 
 struct ShmFormat
 {
     _Atomic size_t progress;
     _Atomic bool is_master_sending;
-    union PswdHash data;
+    _Atomic bool is_password_found;
+    char target_hash[SHM_STRING_SIZE];
+    char found_password[SHM_STRING_SIZE];
 };
 
 struct QueueMsg
@@ -25,12 +21,12 @@ struct QueueMsg
     size_t shm_size;
     int task_id;
     int pswd_fd;
-    char shm_name[NAME_MAX_LEN];
+    int shm_fd;
 };
 
 struct IpcsData
 {
-    char *workerArgv[4]; //todo: remove that from here
+    // char *workerArgv[4]; //todo: remove that from here
     struct ShmFormat *shm_map;
     char *pswd_map;
     struct sigaction *old_action;
@@ -39,8 +35,6 @@ struct IpcsData
     int pswd_fd;
     int shm_fd;
     int queue_fd;
-    char shm_name[NAME_MAX_LEN];
-    char queue_name[NAME_MAX_LEN];
 };
 
 #endif
