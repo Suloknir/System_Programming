@@ -26,7 +26,6 @@ struct QueueMsg
 
 struct IpcsData
 {
-    // char *workerArgv[4]; //todo: remove that from here
     struct ShmFormat *shm_map;
     char *pswd_map;
     struct sigaction *old_action;

@@ -36,6 +36,12 @@ void clean_ipc(void)
         munmap(ipd.shm_map, ipd.shm_size);
     if (ipd.pswd_map != NULL && ipd.pswd_map != MAP_FAILED)
         munmap(ipd.pswd_map, ipd.pswd_length);
+    if (ipd.shm_fd > 0)
+        close(ipd.shm_fd);
+    if (ipd.pswd_fd > 0)
+        close(ipd.pswd_fd);
+    if (ipd.queue_fd > 0)
+        mq_close(ipd.queue_fd);
 }
 
 struct timespec *set_timeout(long ms, struct timespec *ret_timeout)
@@ -92,9 +98,9 @@ void process_task(struct QueueMsg *task)
         const char *hashed = crypt(buffer, salt);
         if (strcmp(ipd.shm_map->target_hash, hashed) == 0)
         {
-            atomic_fetch_add_explicit(&ipd.shm_map->progress, unreported_progress, memory_order_relaxed);
-            atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed);
             snprintf(ipd.shm_map->found_password, SHM_STRING_SIZE, "%s", buffer);
+            atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed);
+            atomic_fetch_add_explicit(&ipd.shm_map->progress, unreported_progress, memory_order_relaxed);
             free(salt);
             free(buffer);
             clean_ipc();
@@ -152,7 +158,7 @@ void crack(mqd_t queue_fd)
         err(EXIT_FAILURE, "mmap error (shm)\n");
     }
     process_task(&task);
-    while (atomic_load_explicit(&ipd.shm_map->is_master_sending, memory_order_relaxed))
+    while (true)
     {
         bytes_received = mq_timedreceive(ipd.queue_fd, (char *)&task, sizeof(task), NULL, set_timeout(10, &timeout));
         if (bytes_received > 0)
@@ -161,7 +167,8 @@ void crack(mqd_t queue_fd)
         }
         else if (bytes_received == -1 && errno == ETIMEDOUT)
         {
-            continue;
+            if (!atomic_load_explicit(&ipd.shm_map->is_master_sending, memory_order_relaxed))
+                break;
         }
         else
         {

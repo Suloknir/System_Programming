@@ -37,9 +37,6 @@
 bool sigint_receaved = false;
 
 struct IpcsData ipd = {0};
-// struct IpcsData ipd = {
-//     .workerArgv = {"./worker", NULL, NULL, NULL}, //
-// };
 
 void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepath, int *ret_n_tasks)
 {
@@ -361,13 +358,12 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         {
             const ssize_t bytes_sent =
                 mq_timedsend(ipd.queue_fd, (const char *)&msg, sizeof(msg), 1, set_timeout(1, &timeout));
-            print_progress(atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed), file_length, bars,
-                           refresh_rate);
+            size_t current_progress = atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed);
+            print_progress(current_progress, file_length, bars, refresh_rate);
             if (bytes_sent == -1)
             {
                 if (errno == ETIMEDOUT)
                 {
-                    // printf("send timeout (probably queue is full)\n"); // fixme: remove in final code
                     continue;
                 }
                 else if (sigint_receaved)
@@ -376,6 +372,11 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
                 }
                 else
                 {
+                    for (int j = 0; j < workers_created; j++)
+                    {
+                        kill(workers[j], SIGTERM);
+                        waitpid(workers[j], NULL, 0);
+                    }
                     clean_ipc();
                     fprintf(stderr, "mq_timedsend error\n");
                     return CRACK_ERR;
@@ -400,22 +401,22 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
 #endif
         if (sigint_receaved)
             atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed);
-        pid_t done = waitpid(-1, NULL, WNOHANG);
-        if (done > 0)
+        // pid_t done = waitpid(-1, NULL, WNOHANG);
+        // if (done > 0)
+        //     workers_running--;
+        // else if (done == -1 && errno == ECHILD)
+        //     break;
+        pid_t done;
+        while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
             workers_running--;
-        else if (done == -1 && errno == ECHILD)
-            break;
     }
-
-    // printf("[MASTER] progress = %lu\n", atomic_load(&ipd.shm_map->progress));
-    // printf("[MASTER] file_length = %lu\n", file_length);
-    if (!sigint_receaved)
-        print_progress(1, 1, bars, refresh_rate);
+    force_print_progress(current_progress, file_length, bars);
     printf("\nsent %d tasks\n", tasks_sent);
+    printf("progress: %lu\n", current_progress);
+    printf("file_length: %lu\n", file_length);
     printf("spawned %d workers\n", workers_created);
     if (sigint_receaved)
     {
-        // print_progress(current_progress, file_length, bars, refresh_rate);
         clean_ipc();
         printf("INTERRUPTED BY SIGNAL [SIGINT]\n");
         return CRACK_ERR;
@@ -432,7 +433,6 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
             *ret_found = NULL;
     }
     clean_ipc();
-    // print_progress(1, 1, bars, refresh_rate);
     if (found)
         return CRACK_FOUND;
     else
