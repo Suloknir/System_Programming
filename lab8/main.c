@@ -18,6 +18,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef EASY_ON_CPU
+#define EASY_ON_CPU true
+#endif
+
 #ifndef CRACK_FOUND
 #define CRACK_FOUND 1
 #endif
@@ -86,6 +90,42 @@ void parse_argv(int argc, char *const *argv, char **ret_hash, char **ret_filepat
 void sigint_handler(int signum) // NOLINT
 {
     sigint_receaved = true;
+}
+
+void force_print_progress(size_t done, size_t to_do, int bars)
+{
+    const float fraction_done = (float)done / to_do; // NOLINT
+    const int bars_to_print = fraction_done * bars; // NOLINT
+    printf("\r[");
+    for (int i = 0; i < bars_to_print; i++)
+        printf("=");
+    for (int i = 0; i < bars - bars_to_print; i++)
+        printf(" ");
+    printf("] %6.2f%%", fraction_done * 100);
+    fflush(stdout);
+}
+
+void print_progress(size_t done, size_t to_do, int bars, float refresh_rate)
+{
+    static bool already_printed = false;
+    static struct timespec last_print;
+    if (!already_printed || done == to_do)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &last_print);
+        force_print_progress(done, to_do, bars);
+        already_printed = true;
+        return;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const float elapsed =
+        (float)(now.tv_sec - last_print.tv_sec) + (float)(now.tv_nsec - last_print.tv_nsec) / 1e9; // NOLINT
+    if (elapsed >= 1.0f / refresh_rate)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &last_print);
+        force_print_progress(done, to_do, bars);
+    }
 }
 
 void clean_ipc(void)
@@ -241,7 +281,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         NULL,
     };
 
-    int processes_created = 0;
+    int workers_created = 0;
     const int workers_to_create = max_workers > total_tasks ? total_tasks : max_workers;
     pid_t workers[workers_to_create];
     for (int i = 0; i < workers_to_create; i++)
@@ -251,7 +291,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         workers[i] = fork();
         if (workers[i] == -1)
         {
-            for (int j = 0; j < processes_created; j++)
+            for (int j = 0; j < workers_created; j++)
             {
                 kill(workers[j], SIGTERM);
                 waitpid(workers[j], NULL, 0);
@@ -267,7 +307,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         }
         else
         {
-            processes_created++;
+            workers_created++;
         }
     }
     const char *mapped = ipd.pswd_map;
@@ -282,6 +322,8 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         approx_task_size = 1;
     size_t next_start_offset = 0;
     int tasks_sent = 0;
+    const float refresh_rate = 24.0f;
+    const int bars = 30;
     for (int i = 0; i < total_tasks; i++)
     {
         if (sigint_receaved)
@@ -314,10 +356,13 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         msg.start_offset = (off_t)task_start_offset;
         msg.task_id = tasks_sent;
         msg.length = task_end_offset - task_start_offset + 1;
+
         while (!sigint_receaved && !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
         {
             const ssize_t bytes_sent =
-                mq_timedsend(ipd.queue_fd, (const char *)&msg, sizeof(msg), 1, set_timeout(10, &timeout));
+                mq_timedsend(ipd.queue_fd, (const char *)&msg, sizeof(msg), 1, set_timeout(1, &timeout));
+            print_progress(atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed), file_length, bars,
+                           refresh_rate);
             if (bytes_sent == -1)
             {
                 if (errno == ETIMEDOUT)
@@ -343,14 +388,38 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     atomic_store_explicit(&ipd.shm_map->is_master_sending, false, memory_order_relaxed);
     munmap(ipd.pswd_map, ipd.pswd_length);
     ipd.pswd_map = NULL;
-    for (int i = 0; i < processes_created; i++)
-        waitpid(workers[i], NULL, 0);
-    printf("sent %d tasks\n", tasks_sent);
+    int workers_running = workers_created;
+    size_t current_progress = atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed);
+    while (workers_running > 0)
+    {
+        current_progress = atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed);
+        print_progress(current_progress, file_length, bars, refresh_rate);
+#if EASY_ON_CPU == true
+        const struct timespec loop_sleep = {0, 1000000};
+        nanosleep(&loop_sleep, NULL);
+#endif
+        if (sigint_receaved)
+            atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed);
+        pid_t done = waitpid(-1, NULL, WNOHANG);
+        if (done > 0)
+            workers_running--;
+        else if (done == -1 && errno == ECHILD)
+            break;
+    }
+
     // printf("[MASTER] progress = %lu\n", atomic_load(&ipd.shm_map->progress));
     // printf("[MASTER] file_length = %lu\n", file_length);
-    printf("spawned %d workers\n", processes_created);
+    if (!sigint_receaved)
+        print_progress(1, 1, bars, refresh_rate);
+    printf("\nsent %d tasks\n", tasks_sent);
+    printf("spawned %d workers\n", workers_created);
     if (sigint_receaved)
+    {
+        // print_progress(current_progress, file_length, bars, refresh_rate);
+        clean_ipc();
         printf("INTERRUPTED BY SIGNAL [SIGINT]\n");
+        return CRACK_ERR;
+    }
     const bool found = atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed);
     if (found)
     {
@@ -363,6 +432,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
             *ret_found = NULL;
     }
     clean_ipc();
+    // print_progress(1, 1, bars, refresh_rate);
     if (found)
         return CRACK_FOUND;
     else
@@ -401,6 +471,5 @@ int main(const int argc, char *argv[])
     clock_gettime(CLOCK_MONOTONIC, &end);
     const double elapsed = (double)(end.tv_sec - start.tv_sec) + (double)(end.tv_nsec - start.tv_nsec) / 1e9;
     printf("\nFinished in %.2fs,\n", elapsed);
-    // printf("Pid: %d\n", getpid());
     return 0;
 }
