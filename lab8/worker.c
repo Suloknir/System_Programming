@@ -151,21 +151,24 @@ void crack(mqd_t queue_fd)
         clean_ipc();
         err(EXIT_FAILURE, "mmap error (shm)\n");
     }
-    do
+    process_task(&task);
+    while (atomic_load_explicit(&ipd.shm_map->is_master_sending, memory_order_relaxed))
     {
-        process_task(&task);
         bytes_received = mq_timedreceive(ipd.queue_fd, (char *)&task, sizeof(task), NULL, set_timeout(10, &timeout));
-        if (bytes_received == -1)
+        if (bytes_received > 0)
         {
-            if (errno == ETIMEDOUT)
-                continue;
-            else
-            {
-                clean_ipc();
-                err(EXIT_FAILURE, "mq_timedreceive error\n");
-            }
+            process_task(&task);
         }
-    } while (bytes_received > 0 || atomic_load_explicit(&ipd.shm_map->is_master_sending, memory_order_relaxed));
+        else if (bytes_received == -1 && errno == ETIMEDOUT)
+        {
+            continue;
+        }
+        else
+        {
+            clean_ipc();
+            err(EXIT_FAILURE, "mq_timedreceive error\n");
+        }
+    }
 }
 
 int main(const int argc, char *argv[])
