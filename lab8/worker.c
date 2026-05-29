@@ -57,7 +57,7 @@ struct timespec *set_timeout(long ms, struct timespec *ret_timeout)
     return ret_timeout;
 }
 
-void process_task(struct QueueMsg *task)
+void process_task(struct QueueTask *task, int worker_id)
 {
     size_t buff_len = 64;
     char *buffer = malloc(buff_len * sizeof *buffer);
@@ -109,20 +109,22 @@ void process_task(struct QueueMsg *task)
         unreported_progress += line_length;
         if (unreported_progress >= progress_min_update)
         {
+            ipd.shm_map->active_tasks[worker_id].reported_progress += unreported_progress;
             atomic_fetch_add_explicit(&ipd.shm_map->progress, unreported_progress, memory_order_relaxed);
             unreported_progress = 0;
         }
         current = line_end + 1;
     } while (current <= end && !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed));
+    ipd.shm_map->active_tasks[worker_id].reported_progress += unreported_progress;
     atomic_fetch_add_explicit(&ipd.shm_map->progress, unreported_progress, memory_order_relaxed);
     free(salt);
     free(buffer);
 }
 
-void crack(mqd_t queue_fd)
+void crack(mqd_t queue_fd, int worker_id)
 {
     ipd.queue_fd = queue_fd;
-    struct QueueMsg task;
+    struct QueueTask task;
     struct timespec timeout;
     ssize_t bytes_received =
         mq_timedreceive(ipd.queue_fd, (char *)&task, sizeof(task), NULL, set_timeout(3000, &timeout));
@@ -157,13 +159,18 @@ void crack(mqd_t queue_fd)
         clean_ipc();
         err(EXIT_FAILURE, "mmap error (shm)\n");
     }
-    process_task(&task);
+    task.reported_progress = 0;
+    ipd.shm_map->active_tasks[worker_id] = task;
+    process_task(&task, worker_id);
+    ipd.shm_map->active_tasks[worker_id].task_id = TASK_FINISHED;
     while (true)
     {
         bytes_received = mq_timedreceive(ipd.queue_fd, (char *)&task, sizeof(task), NULL, set_timeout(10, &timeout));
         if (bytes_received > 0)
         {
-            process_task(&task);
+            ipd.shm_map->active_tasks[worker_id] = task;
+            process_task(&task, worker_id);
+            ipd.shm_map->active_tasks[worker_id].task_id = TASK_FINISHED;
         }
         else if (bytes_received == -1 && errno == ETIMEDOUT)
         {
@@ -181,12 +188,13 @@ void crack(mqd_t queue_fd)
 int main(const int argc, char *argv[])
 {
     prctl(PR_SET_PDEATHSIG, SIGTERM);
-    if (argc != 3)
+    if (argc != 4)
         err(EXIT_FAILURE, "argc != 3");
     const mqd_t queue_fd = atoi(argv[1]);
     const pid_t master_pid = atoi(argv[2]);
+    const int worker_id = atoi(argv[3]);
     if (master_pid != getppid())
         err(EXIT_FAILURE, "Master process terminated before worker called prctl()\n");
-    crack(queue_fd);
+    crack(queue_fd, worker_id);
     return 0;
 }

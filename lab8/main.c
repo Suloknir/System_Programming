@@ -1,5 +1,3 @@
-// todo: sigchild handler
-// todo: sigrtmin + 1 handler in master if worker found password (found password written in shm->salted_hash)
 #define _GNU_SOURCE
 #include "ipc_datatypes.h"
 #include <err.h>
@@ -181,7 +179,7 @@ short create_ipcs(const char *salted_hash)
     char queue_name[] = "/hash_cracker_queue";
     char shm_name[] = "/hash_cracker_shm";
     struct mq_attr attr = {0};
-    attr.mq_msgsize = sizeof(struct QueueMsg);
+    attr.mq_msgsize = sizeof(struct QueueTask);
     attr.mq_maxmsg = 10;
     // cleaner_data.queue_fd = mq_open(cleaner_data.queue_name, O_RDWR | O_CREAT | O_EXCL, 0666, &attr);
     ipd.queue_fd = mq_open(queue_name, O_RDWR | O_CREAT, 0666, &attr);
@@ -220,7 +218,8 @@ short create_ipcs(const char *salted_hash)
     atomic_store_explicit(&ipd.shm_map->is_password_found, false, memory_order_relaxed);
     atomic_store_explicit(&ipd.shm_map->is_master_sending, true, memory_order_relaxed);
     snprintf(ipd.shm_map->target_hash, SHM_STRING_SIZE, "%s", salted_hash);
-
+    for (int i = 0; i < MAX_WORKERS; i++)
+        ipd.shm_map->active_tasks[i].task_id = TASK_FINISHED;
     printf("queue name: %s\n", queue_name);
     return 0;
 }
@@ -236,9 +235,12 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sa.sa_handler = sigint_handler;
-    sigaction(SIGINT, &sa, &ipd.old_action);;
+    sigaction(SIGINT, &sa, &ipd.old_action);
+    ;
 
-    const int max_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    int max_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (max_workers > MAX_WORKERS)
+        max_workers = MAX_WORKERS;
     if (create_ipcs(salted_hash) != 0)
         return CRACK_ERR;
     ipd.pswd_fd = open(pswd_path, O_RDONLY);
@@ -267,15 +269,12 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         return CRACK_ERR;
     }
     const size_t av_len = 16;
-    char arg[3][av_len];
+    char arg[4][av_len];
     snprintf(arg[0], av_len, "./worker");
     snprintf(arg[1], av_len, "%d", ipd.queue_fd);
     snprintf(arg[2], av_len, "%d", getpid());
     char *workerArgv[] = {
-        arg[0],
-        arg[1],
-        arg[2],
-        NULL,
+        arg[0], arg[1], arg[2], arg[3], NULL,
     };
 
     int workers_created = 0;
@@ -285,6 +284,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     {
         if (sigint_receaved)
             break;
+        snprintf(arg[3], av_len, "%d", i);
         workers[i] = fork();
         if (workers[i] == -1)
         {
@@ -309,10 +309,10 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     }
     const char *mapped = ipd.pswd_map;
     const size_t file_length = ipd.pswd_length;
-    struct QueueMsg msg = {0};
-    msg.pswd_fd = ipd.pswd_fd;
-    msg.shm_size = ipd.shm_size;
-    msg.shm_fd = ipd.shm_fd;
+    struct QueueTask task = {0};
+    task.pswd_fd = ipd.pswd_fd;
+    task.shm_size = ipd.shm_size;
+    task.shm_fd = ipd.shm_fd;
 
     size_t approx_task_size = file_length / total_tasks;
     if (approx_task_size == 0)
@@ -351,26 +351,54 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
         }
         next_start_offset = task_end_offset + 1;
         struct timespec timeout;
-        msg.start_offset = (off_t)task_start_offset;
-        msg.task_id = tasks_sent;
-        msg.length = task_end_offset - task_start_offset + 1;
+        task.start_offset = (off_t)task_start_offset;
+        task.task_id = tasks_sent;
+        task.length = task_end_offset - task_start_offset + 1;
 
         while (!sigint_receaved && !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
         {
             const ssize_t bytes_sent =
-                mq_timedsend(ipd.queue_fd, (const char *)&msg, sizeof(msg), 1, set_timeout(1, &timeout));
+                mq_timedsend(ipd.queue_fd, (const char *)&task, sizeof(task), 0, set_timeout(1, &timeout));
             size_t current_progress = atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed);
             print_progress(current_progress, file_length, bars, refresh_rate);
             if (bytes_sent == -1)
             {
                 if (errno == ETIMEDOUT)
                 {
-                    pid_t done;
-                    while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
+                    pid_t dead_worker_pid;
+                    while ((dead_worker_pid = waitpid(-1, NULL, WNOHANG)) > 0)
+                    {
                         workers_running--;
+                        int dead_index = -1;
+                        for (int i = 0; i < workers_created; i++)
+                        {
+                            if (workers[i] == dead_worker_pid)
+                            {
+                                dead_index = i;
+                                break;
+                            }
+                        }
+                        if (dead_index != -1)
+                        {
+                            struct QueueTask task_to_recover = ipd.shm_map->active_tasks[dead_index];
+                            if (task_to_recover.task_id != TASK_FINISHED)
+                            {
+                                fprintf(stderr, "\n[ALERT] Worker %d died, (lost %6.2f%%progress)\n", //
+                                        dead_worker_pid, //
+                                        (float)task_to_recover.reported_progress / (float)file_length * 100);
+                                atomic_fetch_sub_explicit(&ipd.shm_map->progress, //
+                                                          task_to_recover.reported_progress, //
+                                                          memory_order_relaxed);
+                                task_to_recover.reported_progress = 0;
+                                if (workers_running > 0)
+                                    mq_send(ipd.queue_fd, (const char *)&task_to_recover, sizeof(task_to_recover), 1);
+                                ipd.shm_map->active_tasks[dead_index].task_id = TASK_FINISHED;
+                            }
+                        }
+                    }
                     if (workers_running <= 0)
                     {
-                        fprintf(stderr, "[FATAL] all workers died");
+                        fprintf(stderr, "\n[FATAL] all workers died\n");
                         clean_ipc();
                         return CRACK_ERR;
                     }
@@ -410,9 +438,39 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
 #endif
         if (sigint_receaved)
             atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed);
-        pid_t done;
-        while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
+        pid_t dead_worker_pid;
+        while ((dead_worker_pid = waitpid(-1, NULL, WNOHANG)) > 0)
+        {
             workers_running--;
+            int dead_index = -1;
+            for (int i = 0; i < workers_created; i++)
+            {
+                if (workers[i] == dead_worker_pid)
+                {
+                    dead_index = i;
+                    break;
+                }
+            }
+            if (dead_index != -1)
+            {
+                struct QueueTask task_to_recover = ipd.shm_map->active_tasks[dead_index];
+                if (task_to_recover.task_id != TASK_FINISHED)
+                {
+                    fprintf(stderr, "\n[ALERT] Worker %d died, (lost %6.2f%%progress)\n", //
+                            dead_worker_pid, //
+                            (float)task_to_recover.reported_progress / (float)file_length * 100);
+                    atomic_fetch_sub_explicit(&ipd.shm_map->progress, //
+                                              task_to_recover.reported_progress, //
+                                              memory_order_relaxed);
+                    task_to_recover.reported_progress = 0;
+                    if (workers_running > 0)
+                        mq_send(ipd.queue_fd, (const char *)&task_to_recover, sizeof(task_to_recover), 1);
+                    else
+                        fprintf(stderr, "\n[FATAL] all workers died\n");
+                    ipd.shm_map->active_tasks[dead_index].task_id = TASK_FINISHED;
+                }
+            }
+        }
     }
     force_print_progress(current_progress, file_length, bars);
     printf("\nsent %d tasks\n", tasks_sent);
