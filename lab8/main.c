@@ -141,7 +141,7 @@ void clean_ipc(void)
         close(ipd.pswd_fd);
     if (ipd.queue_fd > 0)
         mq_close(ipd.queue_fd);
-    sigaction(SIGINT, ipd.old_action, NULL);
+    sigaction(SIGINT, &ipd.old_action, NULL);
 }
 
 struct timespec *set_timeout(long ms, struct timespec *ret_timeout)
@@ -236,7 +236,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sa.sa_handler = sigint_handler;
-    sigaction(SIGINT, &sa, ipd.old_action);
+    sigaction(SIGINT, &sa, &ipd.old_action);;
 
     const int max_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (create_ipcs(salted_hash) != 0)

@@ -1,7 +1,9 @@
 #ifndef _IPC_DATATYPES_H
 #define _IPC_DATATYPES_H 1
+#define _GNU_SOURCE
 #include <sys/types.h>
 #include <stdbool.h>
+#include <signal.h>
 
 #define SHM_STRING_SIZE 256
 
@@ -26,9 +28,9 @@ struct QueueMsg
 
 struct IpcsData
 {
+    struct sigaction old_action;
     struct ShmFormat *shm_map;
     char *pswd_map;
-    struct sigaction *old_action;
     size_t shm_size;
     size_t pswd_length;
     int pswd_fd;
