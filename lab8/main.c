@@ -135,7 +135,7 @@ void clean_ipc(void)
     }
     if (ipd.shm_fd > 0)
         close(ipd.shm_fd);
-    if (ipd.pswd_map == NULL && ipd.pswd_map != MAP_FAILED)
+    if (ipd.pswd_map != NULL && ipd.pswd_map != MAP_FAILED)
         munmap(ipd.pswd_map, ipd.pswd_length);
     if (ipd.pswd_fd > 0)
         close(ipd.pswd_fd);
@@ -321,6 +321,7 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     int tasks_sent = 0;
     const float refresh_rate = 24.0f;
     const int bars = 30;
+    int workers_running = workers_created;
     for (int i = 0; i < total_tasks; i++)
     {
         if (sigint_receaved)
@@ -364,6 +365,15 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
             {
                 if (errno == ETIMEDOUT)
                 {
+                    pid_t done;
+                    while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
+                        workers_running--;
+                    if (workers_running <= 0)
+                    {
+                        fprintf(stderr, "[FATAL] all workers died");
+                        clean_ipc();
+                        return CRACK_ERR;
+                    }
                     continue;
                 }
                 else if (sigint_receaved)
@@ -389,7 +399,6 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
     atomic_store_explicit(&ipd.shm_map->is_master_sending, false, memory_order_relaxed);
     munmap(ipd.pswd_map, ipd.pswd_length);
     ipd.pswd_map = NULL;
-    int workers_running = workers_created;
     size_t current_progress = atomic_load_explicit(&ipd.shm_map->progress, memory_order_relaxed);
     while (workers_running > 0)
     {
@@ -401,11 +410,6 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
 #endif
         if (sigint_receaved)
             atomic_store_explicit(&ipd.shm_map->is_password_found, true, memory_order_relaxed);
-        // pid_t done = waitpid(-1, NULL, WNOHANG);
-        // if (done > 0)
-        //     workers_running--;
-        // else if (done == -1 && errno == ECHILD)
-        //     break;
         pid_t done;
         while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
             workers_running--;
@@ -447,7 +451,6 @@ int main(const int argc, char *argv[])
     parse_argv(argc, argv, &salted_hash, &pswd_path, &total_tasks);
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
-    // crack(salted_hash, pswd_path, total_tasks, &found); // todo: switch statement
     char *found_pass = NULL;
     const short crack_result = crack(salted_hash, pswd_path, total_tasks, &found_pass);
     printf("\n");
