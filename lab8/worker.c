@@ -188,6 +188,7 @@ void crack(mqd_t queue_fd, int worker_id)
 int main(const int argc, char *argv[])
 {
     prctl(PR_SET_PDEATHSIG, SIGTERM);
+    signal(SIGINT, SIG_IGN);
     if (argc != 4)
         err(EXIT_FAILURE, "argc != 3");
     const mqd_t queue_fd = atoi(argv[1]);

@@ -381,7 +381,8 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
                         if (dead_index != -1)
                         {
                             struct QueueTask task_to_recover = ipd.shm_map->active_tasks[dead_index];
-                            if (task_to_recover.task_id != TASK_FINISHED)
+                            if (task_to_recover.task_id != TASK_FINISHED &&
+                                !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
                             {
                                 fprintf(stderr, "\n[ALERT] Worker %d died, (lost %6.2f%%progress)\n", //
                                         dead_worker_pid, //
@@ -390,13 +391,18 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
                                                           task_to_recover.reported_progress, //
                                                           memory_order_relaxed);
                                 task_to_recover.reported_progress = 0;
-                                if (workers_running > 0)
+                                if (workers_running > 0 && //
+                                    !sigint_receaved && //
+                                    !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
+                                {
                                     mq_send(ipd.queue_fd, (const char *)&task_to_recover, sizeof(task_to_recover), 1);
+                                }
                                 ipd.shm_map->active_tasks[dead_index].task_id = TASK_FINISHED;
                             }
                         }
                     }
-                    if (workers_running <= 0)
+                    if (workers_running <= 0 &&
+                        !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
                     {
                         fprintf(stderr, "\n[FATAL] all workers died\n");
                         clean_ipc();
@@ -454,18 +460,23 @@ short crack(const char *salted_hash, const char *pswd_path, int total_tasks, cha
             if (dead_index != -1)
             {
                 struct QueueTask task_to_recover = ipd.shm_map->active_tasks[dead_index];
-                if (task_to_recover.task_id != TASK_FINISHED)
+                if (task_to_recover.task_id != TASK_FINISHED &&
+                    !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
                 {
-                    fprintf(stderr, "\n[ALERT] Worker %d died, (lost %6.2f%%progress)\n", //
+                    fprintf(stderr, "\n[ALERT] Worker %d died, (lost %6.2f%% progress)\n", //
                             dead_worker_pid, //
                             (float)task_to_recover.reported_progress / (float)file_length * 100);
                     atomic_fetch_sub_explicit(&ipd.shm_map->progress, //
                                               task_to_recover.reported_progress, //
                                               memory_order_relaxed);
                     task_to_recover.reported_progress = 0;
-                    if (workers_running > 0)
+                    if (workers_running > 0 && //
+                        !sigint_receaved && //
+                        !atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
+                    {
                         mq_send(ipd.queue_fd, (const char *)&task_to_recover, sizeof(task_to_recover), 1);
-                    else
+                    }
+                    else if (!atomic_load_explicit(&ipd.shm_map->is_password_found, memory_order_relaxed))
                         fprintf(stderr, "\n[FATAL] all workers died\n");
                     ipd.shm_map->active_tasks[dead_index].task_id = TASK_FINISHED;
                 }
